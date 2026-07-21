@@ -5,7 +5,10 @@
 #include "polyizon/vulkan/context.hpp"
 #include "polyizon/vulkan/image.hpp"
 #include "polyizon/vulkan/pipeline.hpp"
+#include "polyizon/vulkan/sky_pipeline.hpp"
+#include "polyizon/vulkan/sky_uniform_buffer_object.hpp"
 #include "polyizon/vulkan/swapchain.hpp"
+#include "polyizon/vulkan/texture3d.hpp"
 #include "polyizon/vulkan/uniform_buffer_object.hpp"
 #include "polyizon/vulkan/vertex.hpp"
 #include "polyizon/window.hpp"
@@ -61,6 +64,7 @@ private:
     void DestroyDescriptorResources();
     void UpdateUniformBuffer(std::uint32_t frameIndex, VkExtent2D extent);
     void UpdateInstanceBuffer(std::uint32_t frameIndex, float time);
+    void UpdateSkyUniformBuffer(std::uint32_t frameIndex, VkExtent2D extent, float time);
     void RenderFrame();
     void InitImGui();
     void ShutdownImGui();
@@ -87,6 +91,11 @@ private:
     // not this pipeline.
     std::unique_ptr<GraphicsPipeline> m_Pipeline;
 
+    // Background sky/cloud pass, drawn first each frame (see RenderFrame()).
+    // Same construction-order reasoning as m_Pipeline above: needs the
+    // swapchain's color/depth formats, doesn't touch Swapchain::Recreate().
+    std::unique_ptr<SkyPipeline> m_SkyPipeline;
+
     // The one static texture (checkerboard.png), uploaded once via
     // Image::CreateFromFile. Must be constructed BEFORE
     // CreateDescriptorResources() — unlike m_VertexBuffer/m_IndexBuffer
@@ -96,6 +105,12 @@ private:
     // writes garbage handles. Declared here, before m_VertexBuffer, to match
     // construction order.
     std::unique_ptr<Image> m_Texture;
+
+    // Cloud noise volume (see noise.hpp), uploaded once via Texture3D. Same
+    // "must precede CreateDescriptorResources()" ordering requirement as
+    // m_Texture above — its view/sampler get written into the sky
+    // descriptor sets there.
+    std::unique_ptr<Texture3D> m_CloudNoiseTexture;
 
     // Static quad geometry, uploaded once via Buffer::CreateDeviceLocal's
     // staging-buffer path. Declared after m_VulkanContext (needs its
@@ -120,6 +135,12 @@ private:
     VkDescriptorPool m_DescriptorPool = VK_NULL_HANDLE;
     std::array<VkDescriptorSet, kMaxFramesInFlight> m_DescriptorSets{};
 
+    // Sky pass's own per-frame-in-flight UBOs + descriptor sets, allocated
+    // from the same m_DescriptorPool (grown to fit both sets of resources —
+    // see CreateDescriptorResources()) rather than a second pool.
+    std::array<std::unique_ptr<Buffer>, kMaxFramesInFlight> m_SkyUniformBuffers;
+    std::array<VkDescriptorSet, kMaxFramesInFlight> m_SkyDescriptorSets{};
+
     // Frame-in-flight sync state, indexed by m_CurrentFrame (not swapchain
     // image index — see Swapchain for why render-finished semaphores differ).
     // Raw handles + a private Destroy() helper, matching VulkanContext's
@@ -142,6 +163,26 @@ private:
     double m_LastMouseX = 0.0;
     double m_LastMouseY = 0.0;
     bool m_FirstMouseSample = true;
+
+    // Sky/atmosphere tunables, bound directly to ImGui sliders in
+    // BuildDebugOverlay() — same "public field + SliderFloat" pattern as
+    // Camera's movementSpeed/mouseSensitivity above.
+    float m_SunElevationDegrees = 25.0f;
+    float m_SunAzimuthDegrees = 0.0f;
+    int m_AtmospherePrimarySteps = 16;
+    int m_AtmosphereSunSteps = 8;
+
+    // Cloud tunables (see UpdateSkyUniformBuffer()/sky.frag's cloud
+    // raymarch). Layer altitude, HG lobes, powder/ambient strength, and
+    // noise UV scale are fixed constants (not exposed) — only the ones worth
+    // live-tweaking for the coverage/density/wind/performance tradeoff are
+    // sliders.
+    float m_CloudCoverage = 0.45f;
+    float m_CloudDensityMultiplier = 1.0f;
+    float m_CloudWindSpeed = 0.02f;
+    float m_CloudWindDirectionDegrees = 0.0f;
+    int m_CloudPrimarySteps = 64;
+    int m_CloudSunShadowSteps = 6;
 };
 
 } // namespace polyizon

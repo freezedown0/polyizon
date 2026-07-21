@@ -1,5 +1,7 @@
 #include "polyizon/application.hpp"
 
+#include "polyizon/noise.hpp"
+
 #include <GLFW/glfw3.h>
 
 #include <glm/gtc/matrix_transform.hpp>
@@ -12,6 +14,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <stdexcept>
@@ -94,8 +97,15 @@ Application::Application(const ApplicationSpec& spec) {
     m_Swapchain = std::make_unique<Swapchain>(*m_VulkanContext, *m_Window);
     m_Pipeline = std::make_unique<GraphicsPipeline>(
         m_VulkanContext->GetDevice(), m_Swapchain->GetImageFormat(), m_Swapchain->GetDepthFormat());
+    m_SkyPipeline = std::make_unique<SkyPipeline>(
+        m_VulkanContext->GetDevice(), m_Swapchain->GetImageFormat(), m_Swapchain->GetDepthFormat());
 
     m_Texture = Image::CreateFromFile(*m_VulkanContext, "checkerboard.png"); // must precede CreateDescriptorResources()
+
+    constexpr std::uint32_t kCloudNoiseResolution = 128;
+    const std::vector<std::uint8_t> cloudNoiseData = GenerateCloudNoiseVolume(kCloudNoiseResolution);
+    m_CloudNoiseTexture = std::make_unique<Texture3D>(
+        *m_VulkanContext, cloudNoiseData.data(), kCloudNoiseResolution, kCloudNoiseResolution, kCloudNoiseResolution);
 
     CreateDescriptorResources();
 
@@ -294,19 +304,27 @@ void Application::CreateDescriptorResources() {
     for (std::uint32_t i = 0; i < kMaxFramesInFlight; ++i) {
         m_UniformBuffers[i] = std::make_unique<Buffer>(
             m_VulkanContext->GetAllocator(), sizeof(UniformBufferObject), VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT);
+        m_SkyUniformBuffers[i] = std::make_unique<Buffer>(
+            m_VulkanContext->GetAllocator(), sizeof(SkyUniformBufferObject), VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT);
     }
 
+    // poolSizes[0] (UBO) covers both the quad pipeline's per-frame UBO and
+    // the sky pipeline's per-frame UBO — kMaxFramesInFlight * 2 total sets
+    // now come out of this one pool (quad set + sky set per frame-in-flight)
+    // rather than adding a second pool. poolSizes[1] (combined image
+    // sampler) similarly covers both the quad pipeline's checkerboard
+    // texture and the sky pipeline's cloud noise volume.
     std::array<VkDescriptorPoolSize, 2> poolSizes{};
     poolSizes[0].type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
-    poolSizes[0].descriptorCount = kMaxFramesInFlight;
+    poolSizes[0].descriptorCount = kMaxFramesInFlight * 2;
     poolSizes[1].type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-    poolSizes[1].descriptorCount = kMaxFramesInFlight;
+    poolSizes[1].descriptorCount = kMaxFramesInFlight * 2;
 
     VkDescriptorPoolCreateInfo poolInfo{};
     poolInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
     poolInfo.poolSizeCount = static_cast<std::uint32_t>(poolSizes.size());
     poolInfo.pPoolSizes = poolSizes.data();
-    poolInfo.maxSets = kMaxFramesInFlight;
+    poolInfo.maxSets = kMaxFramesInFlight * 2;
 
     if (vkCreateDescriptorPool(device, &poolInfo, nullptr, &m_DescriptorPool) != VK_SUCCESS) {
         throw std::runtime_error("Failed to create Vulkan descriptor pool");
@@ -323,6 +341,19 @@ void Application::CreateDescriptorResources() {
 
     if (vkAllocateDescriptorSets(device, &allocInfo, m_DescriptorSets.data()) != VK_SUCCESS) {
         throw std::runtime_error("Failed to allocate Vulkan descriptor sets");
+    }
+
+    std::array<VkDescriptorSetLayout, kMaxFramesInFlight> skyLayouts{};
+    skyLayouts.fill(m_SkyPipeline->GetDescriptorSetLayout());
+
+    VkDescriptorSetAllocateInfo skyAllocInfo{};
+    skyAllocInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+    skyAllocInfo.descriptorPool = m_DescriptorPool;
+    skyAllocInfo.descriptorSetCount = kMaxFramesInFlight;
+    skyAllocInfo.pSetLayouts = skyLayouts.data();
+
+    if (vkAllocateDescriptorSets(device, &skyAllocInfo, m_SkyDescriptorSets.data()) != VK_SUCCESS) {
+        throw std::runtime_error("Failed to allocate Vulkan sky descriptor sets");
     }
 
     // Bind each frame-slot's descriptor set to its own persistent UBO buffer
@@ -356,6 +387,33 @@ void Application::CreateDescriptorResources() {
         writes[1].pImageInfo = &imageInfo;
 
         vkUpdateDescriptorSets(device, static_cast<std::uint32_t>(writes.size()), writes.data(), 0, nullptr);
+
+        VkDescriptorBufferInfo skyBufferInfo{};
+        skyBufferInfo.buffer = m_SkyUniformBuffers[i]->GetBuffer();
+        skyBufferInfo.offset = 0;
+        skyBufferInfo.range = sizeof(SkyUniformBufferObject);
+
+        VkDescriptorImageInfo cloudNoiseInfo{};
+        cloudNoiseInfo.sampler = m_CloudNoiseTexture->GetSampler();
+        cloudNoiseInfo.imageView = m_CloudNoiseTexture->GetImageView();
+        cloudNoiseInfo.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+
+        std::array<VkWriteDescriptorSet, 2> skyWrites{};
+        skyWrites[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        skyWrites[0].dstSet = m_SkyDescriptorSets[i];
+        skyWrites[0].dstBinding = 0;
+        skyWrites[0].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+        skyWrites[0].descriptorCount = 1;
+        skyWrites[0].pBufferInfo = &skyBufferInfo;
+
+        skyWrites[1].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        skyWrites[1].dstSet = m_SkyDescriptorSets[i];
+        skyWrites[1].dstBinding = 1;
+        skyWrites[1].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        skyWrites[1].descriptorCount = 1;
+        skyWrites[1].pImageInfo = &cloudNoiseInfo;
+
+        vkUpdateDescriptorSets(device, static_cast<std::uint32_t>(skyWrites.size()), skyWrites.data(), 0, nullptr);
     }
 }
 
@@ -391,6 +449,42 @@ void Application::UpdateInstanceBuffer(std::uint32_t frameIndex, float time) {
     m_InstanceBuffers[frameIndex]->Upload(models.data(), sizeof(glm::mat4) * kInstanceCount);
 }
 
+void Application::UpdateSkyUniformBuffer(std::uint32_t frameIndex, VkExtent2D extent, float time) {
+    SkyUniformBufferObject sky{};
+    sky.invView = glm::inverse(m_Camera.GetViewMatrix());
+
+    // Same Y-flipped perspective as UpdateUniformBuffer() above — the sky
+    // pass needs the identical projection to reconstruct rays that line up
+    // with what the quads are drawn with.
+    const float aspect = static_cast<float>(extent.width) / static_cast<float>(extent.height);
+    glm::mat4 proj = glm::perspective(glm::radians(45.0f), aspect, 0.1f, 10.0f);
+    proj[1][1] *= -1.0f;
+    sky.invProj = glm::inverse(proj);
+
+    const float elevation = glm::radians(m_SunElevationDegrees);
+    const float azimuth = glm::radians(m_SunAzimuthDegrees);
+    sky.sunDirection = glm::vec4(glm::normalize(glm::vec3(
+        std::cos(elevation) * std::cos(azimuth),
+        std::sin(elevation),
+        std::cos(elevation) * std::sin(azimuth))), 0.0f);
+
+    sky.timeAndSun = glm::vec4(time, glm::radians(0.5f), 0.0f, 0.0f);
+    sky.atmosphereParams0 = glm::vec4(6360.0f, 60.0f, 0.5f, 8.0f);  // planetRadius, atmosphereHeight, eyeHeight, rayleighScaleHeight (km)
+    sky.atmosphereParams1 = glm::vec4(1.2f, 0.76f, 20.0f, 0.0f);    // mieScaleHeight (km), mieG, sunIntensity
+
+    // Cloud layer: bottom/top are km above the planet surface (well within
+    // the 60km atmosphere shell above); forwardG/backG give the dual-lobe
+    // Henyey-Greenstein silver-lining look; noiseUvScale controls how many
+    // times the 128^3 noise volume tiles across the cloud layer.
+    sky.cloudParams0 = glm::vec4(1.5f, 4.0f, m_CloudCoverage, m_CloudDensityMultiplier);
+    sky.cloudParams1 = glm::vec4(m_CloudWindSpeed, glm::radians(m_CloudWindDirectionDegrees), 0.8f, -0.2f);
+    sky.cloudParams2 = glm::vec4(1.0f, 0.3f, 0.02f, 0.0f); // powderStrength, ambientStrength, noiseUvScale
+
+    sky.stepCounts = glm::ivec4(m_AtmospherePrimarySteps, m_AtmosphereSunSteps, m_CloudPrimarySteps, m_CloudSunShadowSteps);
+
+    m_SkyUniformBuffers[frameIndex]->Upload(&sky, sizeof(sky));
+}
+
 void Application::RenderFrame() {
     VkDevice device = m_VulkanContext->GetDevice();
     VkFence inFlightFence = m_InFlightFences[m_CurrentFrame];
@@ -413,6 +507,7 @@ void Application::RenderFrame() {
     const float time = static_cast<float>(glfwGetTime());
     UpdateUniformBuffer(m_CurrentFrame, extent);
     UpdateInstanceBuffer(m_CurrentFrame, time);
+    UpdateSkyUniformBuffer(m_CurrentFrame, extent, time);
 
     ImGui_ImplVulkan_NewFrame();
     ImGui_ImplGlfw_NewFrame();
@@ -476,9 +571,11 @@ void Application::RenderFrame() {
     colorAttachment.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
     colorAttachment.imageView = m_Swapchain->GetImageView(imageIndex);
     colorAttachment.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-    colorAttachment.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+    // DONT_CARE, not CLEAR: the sky pass (drawn first below) is a fullscreen
+    // triangle that unconditionally overwrites every pixel itself, making the
+    // old hardcoded clear color dead code.
+    colorAttachment.loadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
     colorAttachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
-    colorAttachment.clearValue.color = { { 0.02f, 0.02f, 0.05f, 1.0f } };
 
     VkRenderingAttachmentInfo depthAttachment{};
     depthAttachment.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
@@ -498,16 +595,8 @@ void Application::RenderFrame() {
 
     vkCmdBeginRendering(cmd, &renderingInfo);
 
-    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_Pipeline->GetPipeline());
-
-    const VkBuffer vertexBuffers[] = { m_VertexBuffer->GetBuffer(), m_InstanceBuffers[m_CurrentFrame]->GetBuffer() };
-    const VkDeviceSize offsets[] = { 0, 0 };
-    vkCmdBindVertexBuffers(cmd, 0, 2, vertexBuffers, offsets);
-    vkCmdBindIndexBuffer(cmd, m_IndexBuffer->GetBuffer(), 0, VK_INDEX_TYPE_UINT16);
-
-    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_Pipeline->GetLayout(), 0, 1,
-        &m_DescriptorSets[m_CurrentFrame], 0, nullptr);
-
+    // Viewport/scissor are dynamic state shared by every pipeline bound this
+    // pass (sky, then quads) — set once here rather than per-pipeline.
     VkViewport viewport{};
     viewport.width = static_cast<float>(extent.width);
     viewport.height = static_cast<float>(extent.height);
@@ -517,6 +606,24 @@ void Application::RenderFrame() {
 
     VkRect2D scissor{ { 0, 0 }, extent };
     vkCmdSetScissor(cmd, 0, 1, &scissor);
+
+    // Sky pass: fullscreen triangle, no vertex/index buffer, drawn first so
+    // it paints the background every pixel that scene geometry doesn't cover
+    // (depth test/write are both off in this pipeline — see SkyPipeline).
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_SkyPipeline->GetPipeline());
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_SkyPipeline->GetLayout(), 0, 1,
+        &m_SkyDescriptorSets[m_CurrentFrame], 0, nullptr);
+    vkCmdDraw(cmd, 3, 1, 0, 0);
+
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_Pipeline->GetPipeline());
+
+    const VkBuffer vertexBuffers[] = { m_VertexBuffer->GetBuffer(), m_InstanceBuffers[m_CurrentFrame]->GetBuffer() };
+    const VkDeviceSize offsets[] = { 0, 0 };
+    vkCmdBindVertexBuffers(cmd, 0, 2, vertexBuffers, offsets);
+    vkCmdBindIndexBuffer(cmd, m_IndexBuffer->GetBuffer(), 0, VK_INDEX_TYPE_UINT16);
+
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_Pipeline->GetLayout(), 0, 1,
+        &m_DescriptorSets[m_CurrentFrame], 0, nullptr);
 
     // All instances share the single bound vertex/index buffer and
     // descriptor set (only view/proj/texture live there now); per-instance
@@ -629,6 +736,18 @@ void Application::BuildDebugOverlay() {
     ImGui::Text("Camera position: (%.2f, %.2f, %.2f)", pos.x, pos.y, pos.z);
     ImGui::SliderFloat("Move speed", &m_Camera.movementSpeed, 0.5f, 10.0f);
     ImGui::SliderFloat("Mouse sensitivity", &m_Camera.mouseSensitivity, 0.01f, 0.5f);
+    if (ImGui::CollapsingHeader("Sky", ImGuiTreeNodeFlags_DefaultOpen)) {
+        ImGui::SliderFloat("Sun elevation", &m_SunElevationDegrees, -20.0f, 90.0f);
+        ImGui::SliderFloat("Sun azimuth", &m_SunAzimuthDegrees, 0.0f, 360.0f);
+        ImGui::SliderInt("Atmosphere steps", &m_AtmospherePrimarySteps, 4, 32);
+        ImGui::SliderInt("Atmosphere sun steps", &m_AtmosphereSunSteps, 2, 16);
+        ImGui::SliderFloat("Cloud coverage", &m_CloudCoverage, 0.0f, 1.0f);
+        ImGui::SliderFloat("Cloud density", &m_CloudDensityMultiplier, 0.0f, 3.0f);
+        ImGui::SliderFloat("Cloud wind speed", &m_CloudWindSpeed, 0.0f, 0.2f);
+        ImGui::SliderFloat("Cloud wind direction", &m_CloudWindDirectionDegrees, 0.0f, 360.0f);
+        ImGui::SliderInt("Cloud steps", &m_CloudPrimarySteps, 16, 128);
+        ImGui::SliderInt("Cloud shadow steps", &m_CloudSunShadowSteps, 2, 12);
+    }
     ImGui::End();
 }
 

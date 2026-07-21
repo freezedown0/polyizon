@@ -21,13 +21,16 @@ target_sources(polyizon_core
         src/window.cpp
         src/application.cpp
         src/camera.cpp
+        src/noise.cpp
 
         # Vulkan abstraction layer
         src/vulkan/context.cpp
         src/vulkan/swapchain.cpp
         src/vulkan/pipeline.cpp
+        src/vulkan/sky_pipeline.cpp
         src/vulkan/buffer.cpp
         src/vulkan/image.cpp
+        src/vulkan/texture3d.cpp
 
         # Vendored imgui_impl_vulkan.cpp (see third_party/imgui_impl_vulkan/):
         # vcpkg's imgui port is installed WITHOUT its vulkan-binding feature
@@ -122,6 +125,8 @@ set(POLYIZON_SHADER_OUTPUT_DIR "${CMAKE_BINARY_DIR}/bin/shaders")
 set(POLYIZON_SHADER_SOURCES
     ${POLYIZON_SHADER_SOURCE_DIR}/triangle.vert
     ${POLYIZON_SHADER_SOURCE_DIR}/triangle.frag
+    ${POLYIZON_SHADER_SOURCE_DIR}/sky.vert
+    ${POLYIZON_SHADER_SOURCE_DIR}/sky.frag
 )
 
 set(POLYIZON_SHADER_OUTPUTS "")
