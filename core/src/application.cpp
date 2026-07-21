@@ -102,10 +102,10 @@ Application::Application(const ApplicationSpec& spec) {
 
     m_Texture = Image::CreateFromFile(*m_VulkanContext, "checkerboard.png"); // must precede CreateDescriptorResources()
 
-    constexpr std::uint32_t kCloudNoiseResolution = 128;
-    const std::vector<std::uint8_t> cloudNoiseData = GenerateCloudNoiseVolume(kCloudNoiseResolution);
-    m_CloudNoiseTexture = std::make_unique<Texture3D>(
-        *m_VulkanContext, cloudNoiseData.data(), kCloudNoiseResolution, kCloudNoiseResolution, kCloudNoiseResolution);
+    const CloudNoiseParams cloudNoiseParams{}; // defaults; not yet developer-editable (see noise.hpp)
+    const std::vector<std::uint8_t> cloudNoiseData = LoadOrGenerateCloudNoiseVolume(cloudNoiseParams);
+    m_CloudNoiseTexture = std::make_unique<Texture3D>(*m_VulkanContext, cloudNoiseData.data(),
+        cloudNoiseParams.resolution, cloudNoiseParams.resolution, cloudNoiseParams.resolution);
 
     CreateDescriptorResources();
 

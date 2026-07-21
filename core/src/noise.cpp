@@ -6,20 +6,26 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdio>
+#include <cstring>
+#include <filesystem>
+#include <fstream>
 #include <random>
+#include <stdexcept>
+
+#define WIN32_LEAN_AND_MEAN
+#define NOMINMAX // Windows.h's min/max macros would otherwise shadow std::min/std::max used throughout this file
+#include <Windows.h>
 
 namespace polyizon {
 
 namespace {
 
-constexpr std::uint32_t kSeed = 1337; // fixed: deterministic cloud shape across runs
-
-std::array<int, 512> BuildPermutationTable() {
+std::array<int, 512> BuildPermutationTable(std::uint32_t seed) {
     std::array<int, 256> p{};
     for (int i = 0; i < 256; ++i) {
         p[static_cast<std::size_t>(i)] = i;
     }
-    std::mt19937 rng(kSeed);
+    std::mt19937 rng(seed);
     for (int i = 255; i > 0; --i) {
         std::uniform_int_distribution<int> dist(0, i);
         std::swap(p[static_cast<std::size_t>(i)], p[static_cast<std::size_t>(dist(rng))]);
@@ -175,12 +181,63 @@ float Remap(float value, float oldMin, float oldMax, float newMin, float newMax)
     return newMin + (value - oldMin) / (oldMax - oldMin) * (newMax - newMin);
 }
 
+// FNV-1a over the struct's raw bytes: this is a cache-invalidation key, not
+// a cryptographic hash, so a simple/fast non-cryptographic hash is the
+// right tool. CloudNoiseParams has no padding worth worrying about (every
+// field is std::uint32_t/int, all 4-byte aligned) so hashing the raw
+// object representation is safe and deterministic across runs.
+std::uint64_t HashCloudNoiseParams(const CloudNoiseParams& params) {
+    constexpr std::uint64_t kOffsetBasis = 14695981039346656037ull;
+    constexpr std::uint64_t kPrime = 1099511628211ull;
+    std::uint64_t hash = kOffsetBasis;
+    const auto* bytes = reinterpret_cast<const unsigned char*>(&params);
+    for (std::size_t i = 0; i < sizeof(CloudNoiseParams); ++i) {
+        hash ^= bytes[i];
+        hash *= kPrime;
+    }
+    return hash;
+}
+
+// Resolved relative to the running executable's own directory, matching
+// GraphicsPipeline's/Image's identical private helper — duplicated here
+// rather than shared, consistent with this codebase's existing precedent
+// (image.cpp's own copy of this exact helper makes the same call).
+std::filesystem::path GetExecutableDirectory() {
+    wchar_t buffer[MAX_PATH];
+    const DWORD length = GetModuleFileNameW(nullptr, buffer, MAX_PATH);
+    if (length == 0 || length == MAX_PATH) {
+        throw std::runtime_error("Failed to resolve executable directory");
+    }
+    return std::filesystem::path(buffer).parent_path();
+}
+
+// Cache file header: magic + version let a stale/corrupt/foreign file be
+// rejected outright; resolution + paramsHash double-check that the cached
+// bytes actually match what the caller asked for (the filename already
+// encodes the hash, but a defensive check here costs nothing and guards
+// against a hypothetical hash collision or a hand-edited/truncated file).
+struct CloudNoiseCacheHeader {
+    char magic[4];
+    std::uint32_t version;
+    std::uint32_t resolution;
+    std::uint64_t paramsHash;
+};
+constexpr char kCacheMagic[4] = { 'P', 'Z', 'C', 'N' };
+constexpr std::uint32_t kCacheVersion = 1;
+
+std::filesystem::path CloudNoiseCachePath(std::uint64_t hash) {
+    char hexHash[17];
+    std::snprintf(hexHash, sizeof(hexHash), "%016llx", static_cast<unsigned long long>(hash));
+    return GetExecutableDirectory() / "textures" / "cache" / (std::string("cloud_noise_") + hexHash + ".bin");
+}
+
 } // namespace
 
-std::vector<std::uint8_t> GenerateCloudNoiseVolume(std::uint32_t resolution) {
+std::vector<std::uint8_t> GenerateCloudNoiseVolume(const CloudNoiseParams& params) {
     const auto startTime = std::chrono::steady_clock::now();
+    const std::uint32_t resolution = params.resolution;
 
-    const std::array<int, 512> perm = BuildPermutationTable();
+    const std::array<int, 512> perm = BuildPermutationTable(params.seed);
     std::vector<std::uint8_t> data(static_cast<std::size_t>(resolution) * resolution * resolution * 4);
 
     for (std::uint32_t z = 0; z < resolution; ++z) {
@@ -194,16 +251,16 @@ std::vector<std::uint8_t> GenerateCloudNoiseVolume(std::uint32_t resolution) {
                 // inverted low-frequency Worley floor (per Schneider's
                 // talk), producing billowy cloud-like puffs rather than
                 // uniform Perlin noise.
-                const float perlin = PerlinFbm3D(perm, u, v, w, /*basePeriod=*/4, /*octaves=*/4); // [-1,1]
-                const float worleyLow = WorleyFbm3D(perm, u, v, w, /*baseCellCount=*/4, /*octaves=*/2);  // [0,1]
+                const float perlin = PerlinFbm3D(perm, u, v, w, params.baseShapePeriod, params.baseShapeOctaves); // [-1,1]
+                const float worleyLow = WorleyFbm3D(perm, u, v, w, params.worleyLowCellCount, params.worleyLowOctaves);  // [0,1]
                 const float baseShape = std::clamp(Remap(perlin, -(1.0f - worleyLow), 1.0f, 0.0f, 1.0f), 0.0f, 1.0f);
 
                 // Erosion/detail octaves, increasing frequency, used
                 // in-shader as a weighted blend (see sky.frag's
                 // SampleCloudDensity).
-                const float detail1 = WorleyFbm3D(perm, u, v, w, /*baseCellCount=*/8, /*octaves=*/2);
-                const float detail2 = WorleyFbm3D(perm, u, v, w, /*baseCellCount=*/16, /*octaves=*/2);
-                const float detail3 = WorleyFbm3D(perm, u, v, w, /*baseCellCount=*/32, /*octaves=*/2);
+                const float detail1 = WorleyFbm3D(perm, u, v, w, params.detail1CellCount, params.detail1Octaves);
+                const float detail2 = WorleyFbm3D(perm, u, v, w, params.detail2CellCount, params.detail2Octaves);
+                const float detail3 = WorleyFbm3D(perm, u, v, w, params.detail3CellCount, params.detail3Octaves);
 
                 const std::size_t index =
                     (static_cast<std::size_t>(z) * resolution * resolution + static_cast<std::size_t>(y) * resolution +
@@ -221,6 +278,50 @@ std::vector<std::uint8_t> GenerateCloudNoiseVolume(std::uint32_t resolution) {
     std::printf("[Noise] Generated %ux%ux%u cloud noise volume in %lld ms\n", resolution, resolution, resolution,
         static_cast<long long>(elapsedMs));
     std::fflush(stdout); // redirected/piped stdout is fully buffered — flush so this is visible immediately, not just at graceful exit
+
+    return data;
+}
+
+std::vector<std::uint8_t> LoadOrGenerateCloudNoiseVolume(const CloudNoiseParams& params) {
+    const std::uint64_t hash = HashCloudNoiseParams(params);
+    const std::filesystem::path cachePath = CloudNoiseCachePath(hash);
+
+    std::ifstream cacheFile(cachePath, std::ios::binary);
+    if (cacheFile) {
+        CloudNoiseCacheHeader header{};
+        cacheFile.read(reinterpret_cast<char*>(&header), sizeof(header));
+        if (cacheFile && std::memcmp(header.magic, kCacheMagic, sizeof(kCacheMagic)) == 0 &&
+            header.version == kCacheVersion && header.resolution == params.resolution && header.paramsHash == hash) {
+            const std::size_t expectedBytes =
+                static_cast<std::size_t>(params.resolution) * params.resolution * params.resolution * 4;
+            std::vector<std::uint8_t> data(expectedBytes);
+            cacheFile.read(reinterpret_cast<char*>(data.data()), static_cast<std::streamsize>(expectedBytes));
+            if (cacheFile) {
+                std::printf("[Noise] Loaded %ux%ux%u cloud noise volume from cache (%s)\n",
+                    params.resolution, params.resolution, params.resolution, cachePath.string().c_str());
+                std::fflush(stdout);
+                return data;
+            }
+            // Fell through: truncated/corrupt cache file past the header — regenerate below.
+        }
+    }
+
+    std::vector<std::uint8_t> data = GenerateCloudNoiseVolume(params);
+
+    std::error_code ec;
+    std::filesystem::create_directories(cachePath.parent_path(), ec);
+    if (!ec) {
+        std::ofstream outFile(cachePath, std::ios::binary | std::ios::trunc);
+        if (outFile) {
+            CloudNoiseCacheHeader header{};
+            std::memcpy(header.magic, kCacheMagic, sizeof(kCacheMagic));
+            header.version = kCacheVersion;
+            header.resolution = params.resolution;
+            header.paramsHash = hash;
+            outFile.write(reinterpret_cast<const char*>(&header), sizeof(header));
+            outFile.write(reinterpret_cast<const char*>(data.data()), static_cast<std::streamsize>(data.size()));
+        }
+    }
 
     return data;
 }
