@@ -109,6 +109,8 @@ void Window::SetKeyCallback(KeyCallback callback) { m_Data.onKey = std::move(cal
 void Window::SetMouseButtonCallback(MouseButtonCallback callback) { m_Data.onMouseButton = std::move(callback); }
 void Window::SetCursorPosCallback(CursorPosCallback callback) { m_Data.onCursorPos = std::move(callback); }
 void Window::SetScrollCallback(ScrollCallback callback) { m_Data.onScroll = std::move(callback); }
+void Window::SetFocusCallback(FocusCallback callback) { m_Data.onFocus = std::move(callback); }
+void Window::SetCursorEnterCallback(CursorEnterCallback callback) { m_Data.onCursorEnter = std::move(callback); }
 
 void Window::SetCursorCaptured(bool captured) {
     glfwSetInputMode(m_Handle, GLFW_CURSOR, captured ? GLFW_CURSOR_DISABLED : GLFW_CURSOR_NORMAL);
@@ -160,6 +162,20 @@ void Window::InstallCallbacks() {
         auto& data = *static_cast<WindowData*>(glfwGetWindowUserPointer(window));
         if (data.onScroll) {
             data.onScroll(xOffset, yOffset);
+        }
+    });
+
+    glfwSetWindowFocusCallback(m_Handle, [](GLFWwindow* window, int focused) {
+        auto& data = *static_cast<WindowData*>(glfwGetWindowUserPointer(window));
+        if (data.onFocus) {
+            data.onFocus(focused);
+        }
+    });
+
+    glfwSetCursorEnterCallback(m_Handle, [](GLFWwindow* window, int entered) {
+        auto& data = *static_cast<WindowData*>(glfwGetWindowUserPointer(window));
+        if (data.onCursorEnter) {
+            data.onCursorEnter(entered);
         }
     });
 }

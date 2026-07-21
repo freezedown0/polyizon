@@ -49,6 +49,10 @@ private:
     void OnWindowClose();
     void OnKey(int key, int scancode, int action, int mods);
     void OnCursorPos(double x, double y);
+    void OnMouseButton(int button, int action, int mods);
+    void OnScroll(double xOffset, double yOffset);
+    void OnWindowFocus(int focused);
+    void OnCursorEnter(int entered);
     void ProcessCameraKeyboardInput(float deltaTime);
 
     void CreateFrameSyncObjects();
@@ -58,6 +62,9 @@ private:
     void UpdateUniformBuffer(std::uint32_t frameIndex, VkExtent2D extent);
     void UpdateInstanceBuffer(std::uint32_t frameIndex, float time);
     void RenderFrame();
+    void InitImGui();
+    void ShutdownImGui();
+    void BuildDebugOverlay();
 
     static constexpr std::uint32_t kMaxFramesInFlight = 2;
     static constexpr float kMaxDeltaTime = 0.1f; // clamp for stalls (window drag-resize, debugger pause, etc.)
