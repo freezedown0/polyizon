@@ -1,0 +1,473 @@
+#include "polyizon/application.hpp"
+
+#include <GLFW/glfw3.h>
+
+#include <glm/gtc/matrix_transform.hpp>
+
+#include <array>
+#include <cstddef>
+#include <cstdint>
+#include <stdexcept>
+
+namespace polyizon {
+
+namespace {
+
+// NDC y is down (no viewport-flip trick used, matching the already-verified
+// hardcoded triangle this replaced) — position.y = -0.5 is toward the top
+// of the window. Texture coordinates need no V-flip: Vulkan's sampling
+// convention puts (0,0) at the image's top-left with V increasing downward,
+// the same direction as this quad's screen-space Y, so corners map 1:1.
+const std::array<Vertex, 4> kQuadVertices = {
+    Vertex{ {-0.5f, -0.5f}, {1.0f, 0.0f, 0.0f}, {0.0f, 0.0f} }, // top-left, red
+    Vertex{ { 0.5f, -0.5f}, {0.0f, 1.0f, 0.0f}, {1.0f, 0.0f} }, // top-right, green
+    Vertex{ { 0.5f,  0.5f}, {0.0f, 0.0f, 1.0f}, {1.0f, 1.0f} }, // bottom-right, blue
+    Vertex{ {-0.5f,  0.5f}, {1.0f, 1.0f, 0.0f}, {0.0f, 1.0f} }, // bottom-left, yellow
+};
+// Winding is clockwise in screen space for both triangles, matching
+// VK_FRONT_FACE_CLOCKWISE (pipeline.cpp) — correct/consistent even though
+// cullMode is currently VK_CULL_MODE_NONE.
+const std::array<std::uint16_t, 6> kQuadIndices = { 0, 1, 2, 2, 3, 0 };
+
+constexpr std::size_t kInstanceCount = 5;
+
+// X shift (0.45) is smaller than the quad's half-width (0.5), so
+// neighboring instances overlap in screen space before perspective is even
+// applied — makes the depth test's effect on occlusion unambiguous in a
+// screenshot. Z recedes from +0.6 (nearest) to -0.6 (farthest).
+const std::array<glm::vec3, kInstanceCount> kInstancePositions = {
+    glm::vec3(-0.9f, 0.0f,  0.6f),
+    glm::vec3(-0.45f, 0.0f, 0.3f),
+    glm::vec3( 0.0f, 0.0f,  0.0f),
+    glm::vec3( 0.45f, 0.0f, -0.3f),
+    glm::vec3( 0.9f, 0.0f, -0.6f),
+};
+
+// Same Z-axis spin as before, phase-shifted per instance (2pi/5 apart) so
+// the row doesn't read as one rigid block — proves per-draw-call push
+// constants are actually taking effect, not just translation.
+glm::mat4 ComputeInstanceModel(std::size_t index, float time) {
+    const float phase = static_cast<float>(index) * glm::radians(72.0f);
+    const glm::mat4 rotation = glm::rotate(
+        glm::mat4(1.0f), time * glm::radians(90.0f) + phase, glm::vec3(0.0f, 0.0f, 1.0f));
+    return glm::translate(glm::mat4(1.0f), kInstancePositions[index]) * rotation;
+}
+
+} // namespace
+
+Application::Application(const ApplicationSpec& spec) {
+    WindowProps props;
+    props.title = spec.name;
+    props.width = spec.windowWidth;
+    props.height = spec.windowHeight;
+
+    m_Window = std::make_unique<Window>(props);
+
+    m_Window->SetCloseCallback([this]() { OnWindowClose(); });
+    m_Window->SetResizeCallback([this](std::uint32_t width, std::uint32_t height) {
+        OnWindowResize(width, height);
+    });
+
+    m_VulkanContext = std::make_unique<VulkanContext>(*m_Window, spec.name);
+    m_Swapchain = std::make_unique<Swapchain>(*m_VulkanContext, *m_Window);
+    m_Pipeline = std::make_unique<GraphicsPipeline>(
+        m_VulkanContext->GetDevice(), m_Swapchain->GetImageFormat(), m_Swapchain->GetDepthFormat());
+
+    m_Texture = Image::CreateFromFile(*m_VulkanContext, "checkerboard.png"); // must precede CreateDescriptorResources()
+
+    CreateDescriptorResources();
+
+    m_VertexBuffer = Buffer::CreateDeviceLocal(*m_VulkanContext, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
+        kQuadVertices.data(), sizeof(Vertex) * kQuadVertices.size());
+    m_IndexBuffer = Buffer::CreateDeviceLocal(*m_VulkanContext, VK_BUFFER_USAGE_INDEX_BUFFER_BIT,
+        kQuadIndices.data(), sizeof(std::uint16_t) * kQuadIndices.size());
+
+    CreateFrameSyncObjects();
+}
+
+Application::~Application() {
+    // GPU work may still be in flight; must finish before the swapchain,
+    // sync objects, and device are torn down (by this destructor and then
+    // the member unique_ptrs, in that order).
+    if (m_VulkanContext) {
+        vkDeviceWaitIdle(m_VulkanContext->GetDevice());
+    }
+    DestroyFrameSyncObjects();
+    DestroyDescriptorResources();
+}
+
+void Application::Run() {
+    m_LastFrameTime = static_cast<float>(glfwGetTime());
+
+    while (m_Running && !m_Window->ShouldClose()) {
+        const float time = static_cast<float>(glfwGetTime());
+        const float deltaTime = time - m_LastFrameTime;
+        m_LastFrameTime = time;
+
+        m_Window->PollEvents();
+        OnUpdate(deltaTime);
+        RenderFrame();
+    }
+}
+
+void Application::Stop() {
+    m_Running = false;
+}
+
+void Application::OnUpdate(float /*deltaTime*/) {
+    // Base loop is intentionally empty. Once the EnTT registry exists, a
+    // derived Application (or this method directly) ticks it here, followed
+    // by renderer frame submission.
+}
+
+void Application::OnWindowResize(std::uint32_t /*width*/, std::uint32_t /*height*/) {
+    // Guarded: GLFW can fire the framebuffer-size callback before the
+    // swapchain is constructed. Actual recreation is deferred to the next
+    // AcquireNextImage() call, never done synchronously here.
+    if (m_Swapchain) {
+        m_Swapchain->NotifyResized();
+    }
+}
+
+void Application::OnWindowClose() {
+    Stop();
+}
+
+void Application::CreateFrameSyncObjects() {
+    VkDevice device = m_VulkanContext->GetDevice();
+
+    VkCommandPoolCreateInfo poolInfo{};
+    poolInfo.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
+    poolInfo.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
+    poolInfo.queueFamilyIndex = m_VulkanContext->GetGraphicsQueueFamily();
+
+    if (vkCreateCommandPool(device, &poolInfo, nullptr, &m_CommandPool) != VK_SUCCESS) {
+        throw std::runtime_error("Failed to create Vulkan command pool");
+    }
+
+    VkCommandBufferAllocateInfo allocInfo{};
+    allocInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+    allocInfo.commandPool = m_CommandPool;
+    allocInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+    allocInfo.commandBufferCount = kMaxFramesInFlight;
+
+    if (vkAllocateCommandBuffers(device, &allocInfo, m_CommandBuffers.data()) != VK_SUCCESS) {
+        throw std::runtime_error("Failed to allocate Vulkan command buffers");
+    }
+
+    VkSemaphoreCreateInfo semaphoreInfo{};
+    semaphoreInfo.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
+
+    VkFenceCreateInfo fenceInfo{};
+    fenceInfo.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
+    fenceInfo.flags = VK_FENCE_CREATE_SIGNALED_BIT; // so frame 0's wait doesn't block forever
+
+    for (std::uint32_t i = 0; i < kMaxFramesInFlight; ++i) {
+        if (vkCreateSemaphore(device, &semaphoreInfo, nullptr, &m_ImageAvailableSemaphores[i]) != VK_SUCCESS ||
+            vkCreateFence(device, &fenceInfo, nullptr, &m_InFlightFences[i]) != VK_SUCCESS) {
+            throw std::runtime_error("Failed to create Vulkan frame sync objects");
+        }
+    }
+}
+
+void Application::DestroyFrameSyncObjects() {
+    if (!m_VulkanContext) {
+        return;
+    }
+    VkDevice device = m_VulkanContext->GetDevice();
+
+    for (std::uint32_t i = 0; i < kMaxFramesInFlight; ++i) {
+        if (m_InFlightFences[i] != VK_NULL_HANDLE) {
+            vkDestroyFence(device, m_InFlightFences[i], nullptr);
+            m_InFlightFences[i] = VK_NULL_HANDLE;
+        }
+        if (m_ImageAvailableSemaphores[i] != VK_NULL_HANDLE) {
+            vkDestroySemaphore(device, m_ImageAvailableSemaphores[i], nullptr);
+            m_ImageAvailableSemaphores[i] = VK_NULL_HANDLE;
+        }
+    }
+
+    if (m_CommandPool != VK_NULL_HANDLE) {
+        vkDestroyCommandPool(device, m_CommandPool, nullptr); // also frees the allocated command buffers
+        m_CommandPool = VK_NULL_HANDLE;
+    }
+}
+
+void Application::CreateDescriptorResources() {
+    VkDevice device = m_VulkanContext->GetDevice();
+
+    for (std::uint32_t i = 0; i < kMaxFramesInFlight; ++i) {
+        m_UniformBuffers[i] = std::make_unique<Buffer>(
+            m_VulkanContext->GetAllocator(), sizeof(UniformBufferObject), VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT);
+    }
+
+    std::array<VkDescriptorPoolSize, 2> poolSizes{};
+    poolSizes[0].type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+    poolSizes[0].descriptorCount = kMaxFramesInFlight;
+    poolSizes[1].type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    poolSizes[1].descriptorCount = kMaxFramesInFlight;
+
+    VkDescriptorPoolCreateInfo poolInfo{};
+    poolInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+    poolInfo.poolSizeCount = static_cast<std::uint32_t>(poolSizes.size());
+    poolInfo.pPoolSizes = poolSizes.data();
+    poolInfo.maxSets = kMaxFramesInFlight;
+
+    if (vkCreateDescriptorPool(device, &poolInfo, nullptr, &m_DescriptorPool) != VK_SUCCESS) {
+        throw std::runtime_error("Failed to create Vulkan descriptor pool");
+    }
+
+    std::array<VkDescriptorSetLayout, kMaxFramesInFlight> layouts{};
+    layouts.fill(m_Pipeline->GetDescriptorSetLayout());
+
+    VkDescriptorSetAllocateInfo allocInfo{};
+    allocInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+    allocInfo.descriptorPool = m_DescriptorPool;
+    allocInfo.descriptorSetCount = kMaxFramesInFlight;
+    allocInfo.pSetLayouts = layouts.data();
+
+    if (vkAllocateDescriptorSets(device, &allocInfo, m_DescriptorSets.data()) != VK_SUCCESS) {
+        throw std::runtime_error("Failed to allocate Vulkan descriptor sets");
+    }
+
+    // Bind each frame-slot's descriptor set to its own persistent UBO buffer
+    // and the (single, static) texture once, here — only the UBO's contents
+    // change per frame (via Upload() in RenderFrame()), never the handles
+    // either binding points at.
+    for (std::uint32_t i = 0; i < kMaxFramesInFlight; ++i) {
+        VkDescriptorBufferInfo bufferInfo{};
+        bufferInfo.buffer = m_UniformBuffers[i]->GetBuffer();
+        bufferInfo.offset = 0;
+        bufferInfo.range = sizeof(UniformBufferObject);
+
+        VkDescriptorImageInfo imageInfo{};
+        imageInfo.sampler = m_Texture->GetSampler();
+        imageInfo.imageView = m_Texture->GetImageView();
+        imageInfo.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+
+        std::array<VkWriteDescriptorSet, 2> writes{};
+        writes[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        writes[0].dstSet = m_DescriptorSets[i];
+        writes[0].dstBinding = 0;
+        writes[0].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+        writes[0].descriptorCount = 1;
+        writes[0].pBufferInfo = &bufferInfo;
+
+        writes[1].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        writes[1].dstSet = m_DescriptorSets[i];
+        writes[1].dstBinding = 1;
+        writes[1].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        writes[1].descriptorCount = 1;
+        writes[1].pImageInfo = &imageInfo;
+
+        vkUpdateDescriptorSets(device, static_cast<std::uint32_t>(writes.size()), writes.data(), 0, nullptr);
+    }
+}
+
+void Application::DestroyDescriptorResources() {
+    if (!m_VulkanContext) {
+        return;
+    }
+    // Destroying the pool implicitly frees all sets allocated from it; the
+    // UBO buffers themselves are unique_ptr and destruct via normal
+    // reverse-declaration-order teardown, not from here.
+    if (m_DescriptorPool != VK_NULL_HANDLE) {
+        vkDestroyDescriptorPool(m_VulkanContext->GetDevice(), m_DescriptorPool, nullptr);
+        m_DescriptorPool = VK_NULL_HANDLE;
+    }
+}
+
+void Application::UpdateUniformBuffer(std::uint32_t frameIndex, VkExtent2D extent) {
+    UniformBufferObject ubo{};
+    ubo.view = glm::lookAt(glm::vec3(0.0f, 0.0f, 2.0f), glm::vec3(0.0f), glm::vec3(0.0f, 1.0f, 0.0f));
+
+    const float aspect = static_cast<float>(extent.width) / static_cast<float>(extent.height);
+    ubo.proj = glm::perspective(glm::radians(45.0f), aspect, 0.1f, 10.0f);
+    ubo.proj[1][1] *= -1.0f; // Vulkan NDC is Y-down; glm::perspective assumes Y-up.
+
+    m_UniformBuffers[frameIndex]->Upload(&ubo, sizeof(ubo));
+}
+
+void Application::RenderFrame() {
+    VkDevice device = m_VulkanContext->GetDevice();
+    VkFence inFlightFence = m_InFlightFences[m_CurrentFrame];
+
+    vkWaitForFences(device, 1, &inFlightFence, VK_TRUE, UINT64_MAX);
+
+    std::uint32_t imageIndex = 0;
+    const Swapchain::AcquireResult acquireResult =
+        m_Swapchain->AcquireNextImage(m_ImageAvailableSemaphores[m_CurrentFrame], imageIndex);
+    if (acquireResult != Swapchain::AcquireResult::Success) {
+        // Minimized, or the swapchain was just rebuilt: nothing to draw this
+        // iteration. The fence is intentionally left signaled (not reset) —
+        // next iteration's wait on it returns immediately, harmlessly.
+        return;
+    }
+
+    vkResetFences(device, 1, &inFlightFence); // only after a confirmed acquire, see header comment
+
+    const VkExtent2D extent = m_Swapchain->GetExtent();
+    UpdateUniformBuffer(m_CurrentFrame, extent);
+
+    VkCommandBuffer cmd = m_CommandBuffers[m_CurrentFrame];
+    vkResetCommandBuffer(cmd, 0);
+
+    VkCommandBufferBeginInfo beginInfo{};
+    beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+    beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    vkBeginCommandBuffer(cmd, &beginInfo);
+
+    VkImage image = m_Swapchain->GetImage(imageIndex);
+    const VkImageSubresourceRange range{ VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+
+    VkImageMemoryBarrier2 toColorAttachment{};
+    toColorAttachment.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
+    toColorAttachment.srcStageMask = VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT;
+    toColorAttachment.srcAccessMask = VK_ACCESS_2_NONE;
+    toColorAttachment.dstStageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
+    toColorAttachment.dstAccessMask = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT;
+    toColorAttachment.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    toColorAttachment.newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    toColorAttachment.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    toColorAttachment.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    toColorAttachment.image = image;
+    toColorAttachment.subresourceRange = range;
+
+    // Depth, like color, is transitioned UNDEFINED -> *_ATTACHMENT_OPTIMAL
+    // unconditionally every frame: it's cleared (loadOp=CLEAR) and never
+    // stored (storeOp=DONT_CARE) below, so its prior contents are always
+    // discarded — UNDEFINED as oldLayout is the correct, spec-legal way to
+    // say that, exactly like the color image's barrier above.
+    const VkImageSubresourceRange depthRange{ VK_IMAGE_ASPECT_DEPTH_BIT, 0, 1, 0, 1 };
+
+    VkImageMemoryBarrier2 toDepthAttachment{};
+    toDepthAttachment.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
+    toDepthAttachment.srcStageMask = VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT;
+    toDepthAttachment.srcAccessMask = VK_ACCESS_2_NONE;
+    toDepthAttachment.dstStageMask =
+        VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT;
+    toDepthAttachment.dstAccessMask = VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+    toDepthAttachment.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    toDepthAttachment.newLayout = VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL;
+    toDepthAttachment.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    toDepthAttachment.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    toDepthAttachment.image = m_Swapchain->GetDepthImage();
+    toDepthAttachment.subresourceRange = depthRange;
+
+    const std::array<VkImageMemoryBarrier2, 2> toAttachmentBarriers = { toColorAttachment, toDepthAttachment };
+    VkDependencyInfo toAttachmentDep{};
+    toAttachmentDep.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
+    toAttachmentDep.imageMemoryBarrierCount = static_cast<std::uint32_t>(toAttachmentBarriers.size());
+    toAttachmentDep.pImageMemoryBarriers = toAttachmentBarriers.data();
+    vkCmdPipelineBarrier2(cmd, &toAttachmentDep);
+
+    VkRenderingAttachmentInfo colorAttachment{};
+    colorAttachment.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
+    colorAttachment.imageView = m_Swapchain->GetImageView(imageIndex);
+    colorAttachment.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    colorAttachment.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+    colorAttachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+    colorAttachment.clearValue.color = { { 0.02f, 0.02f, 0.05f, 1.0f } };
+
+    VkRenderingAttachmentInfo depthAttachment{};
+    depthAttachment.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
+    depthAttachment.imageView = m_Swapchain->GetDepthImageView();
+    depthAttachment.imageLayout = VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL;
+    depthAttachment.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+    depthAttachment.storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE; // never sampled/presented after this frame
+    depthAttachment.clearValue.depthStencil = { 1.0f, 0 };
+
+    VkRenderingInfo renderingInfo{};
+    renderingInfo.sType = VK_STRUCTURE_TYPE_RENDERING_INFO;
+    renderingInfo.renderArea = { { 0, 0 }, extent };
+    renderingInfo.layerCount = 1;
+    renderingInfo.colorAttachmentCount = 1;
+    renderingInfo.pColorAttachments = &colorAttachment;
+    renderingInfo.pDepthAttachment = &depthAttachment;
+
+    vkCmdBeginRendering(cmd, &renderingInfo);
+
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_Pipeline->GetPipeline());
+
+    const VkBuffer vertexBuffers[] = { m_VertexBuffer->GetBuffer() };
+    const VkDeviceSize offsets[] = { 0 };
+    vkCmdBindVertexBuffers(cmd, 0, 1, vertexBuffers, offsets);
+    vkCmdBindIndexBuffer(cmd, m_IndexBuffer->GetBuffer(), 0, VK_INDEX_TYPE_UINT16);
+
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_Pipeline->GetLayout(), 0, 1,
+        &m_DescriptorSets[m_CurrentFrame], 0, nullptr);
+
+    VkViewport viewport{};
+    viewport.width = static_cast<float>(extent.width);
+    viewport.height = static_cast<float>(extent.height);
+    viewport.minDepth = 0.0f;
+    viewport.maxDepth = 1.0f;
+    vkCmdSetViewport(cmd, 0, 1, &viewport);
+
+    VkRect2D scissor{ { 0, 0 }, extent };
+    vkCmdSetScissor(cmd, 0, 1, &scissor);
+
+    // All instances share the single bound vertex/index buffer and
+    // descriptor set (only view/proj/texture live there now) — only the
+    // model matrix varies per instance, pushed right before its own draw.
+    const float time = static_cast<float>(glfwGetTime());
+    for (std::size_t i = 0; i < kInstanceCount; ++i) {
+        const ModelPushConstant push{ ComputeInstanceModel(i, time) };
+        vkCmdPushConstants(cmd, m_Pipeline->GetLayout(), VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof(push), &push);
+        vkCmdDrawIndexed(cmd, 6, 1, 0, 0, 0);
+    }
+
+    vkCmdEndRendering(cmd);
+
+    VkImageMemoryBarrier2 toPresent = toColorAttachment;
+    toPresent.srcStageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
+    toPresent.srcAccessMask = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT;
+    toPresent.dstStageMask = VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT;
+    toPresent.dstAccessMask = VK_ACCESS_2_NONE;
+    toPresent.oldLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    toPresent.newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+
+    VkDependencyInfo toPresentDep{};
+    toPresentDep.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
+    toPresentDep.imageMemoryBarrierCount = 1;
+    toPresentDep.pImageMemoryBarriers = &toPresent;
+    vkCmdPipelineBarrier2(cmd, &toPresentDep);
+
+    vkEndCommandBuffer(cmd);
+
+    VkSemaphore imageAvailable = m_ImageAvailableSemaphores[m_CurrentFrame];
+    VkSemaphore renderFinished = m_Swapchain->GetRenderFinishedSemaphore(imageIndex);
+
+    VkSemaphoreSubmitInfo waitInfo{};
+    waitInfo.sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO;
+    waitInfo.semaphore = imageAvailable;
+    waitInfo.stageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
+
+    VkSemaphoreSubmitInfo signalInfo{};
+    signalInfo.sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO;
+    signalInfo.semaphore = renderFinished;
+    signalInfo.stageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
+
+    VkCommandBufferSubmitInfo cmdSubmitInfo{};
+    cmdSubmitInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO;
+    cmdSubmitInfo.commandBuffer = cmd;
+
+    VkSubmitInfo2 submitInfo{};
+    submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO_2;
+    submitInfo.waitSemaphoreInfoCount = 1;
+    submitInfo.pWaitSemaphoreInfos = &waitInfo;
+    submitInfo.commandBufferInfoCount = 1;
+    submitInfo.pCommandBufferInfos = &cmdSubmitInfo;
+    submitInfo.signalSemaphoreInfoCount = 1;
+    submitInfo.pSignalSemaphoreInfos = &signalInfo;
+
+    if (vkQueueSubmit2(m_VulkanContext->GetGraphicsQueue(), 1, &submitInfo, inFlightFence) != VK_SUCCESS) {
+        throw std::runtime_error("Failed to submit frame command buffer");
+    }
+
+    m_Swapchain->Present(renderFinished, imageIndex);
+
+    m_CurrentFrame = (m_CurrentFrame + 1) % kMaxFramesInFlight;
+}
+
+} // namespace polyizon

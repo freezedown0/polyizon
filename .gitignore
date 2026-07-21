@@ -1,0 +1,20 @@
+# Build output
+/build/
+/out/
+bin/
+*.spv
+
+# Visual Studio / VS Code
+.vs/
+.vscode/
+*.user
+
+# CMake
+CMakeUserPresets.json
+
+# Claude Code local tooling (not project source)
+.claude/
+
+# OS cruft
+Thumbs.db
+desktop.ini
