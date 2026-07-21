@@ -88,6 +88,11 @@ Application::Application(const ApplicationSpec& spec) {
     m_IndexBuffer = Buffer::CreateDeviceLocal(*m_VulkanContext, VK_BUFFER_USAGE_INDEX_BUFFER_BIT,
         kQuadIndices.data(), sizeof(std::uint16_t) * kQuadIndices.size());
 
+    for (std::uint32_t i = 0; i < kMaxFramesInFlight; ++i) {
+        m_InstanceBuffers[i] = std::make_unique<Buffer>(
+            m_VulkanContext->GetAllocator(), sizeof(glm::mat4) * kInstanceCount, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT);
+    }
+
     CreateFrameSyncObjects();
 }
 
@@ -331,6 +336,14 @@ void Application::UpdateUniformBuffer(std::uint32_t frameIndex, VkExtent2D exten
     m_UniformBuffers[frameIndex]->Upload(&ubo, sizeof(ubo));
 }
 
+void Application::UpdateInstanceBuffer(std::uint32_t frameIndex, float time) {
+    std::array<glm::mat4, kInstanceCount> models{};
+    for (std::size_t i = 0; i < kInstanceCount; ++i) {
+        models[i] = ComputeInstanceModel(i, time);
+    }
+    m_InstanceBuffers[frameIndex]->Upload(models.data(), sizeof(glm::mat4) * kInstanceCount);
+}
+
 void Application::RenderFrame() {
     VkDevice device = m_VulkanContext->GetDevice();
     VkFence inFlightFence = m_InFlightFences[m_CurrentFrame];
@@ -350,7 +363,9 @@ void Application::RenderFrame() {
     vkResetFences(device, 1, &inFlightFence); // only after a confirmed acquire, see header comment
 
     const VkExtent2D extent = m_Swapchain->GetExtent();
+    const float time = static_cast<float>(glfwGetTime());
     UpdateUniformBuffer(m_CurrentFrame, extent);
+    UpdateInstanceBuffer(m_CurrentFrame, time);
 
     VkCommandBuffer cmd = m_CommandBuffers[m_CurrentFrame];
     vkResetCommandBuffer(cmd, 0);
@@ -432,9 +447,9 @@ void Application::RenderFrame() {
 
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_Pipeline->GetPipeline());
 
-    const VkBuffer vertexBuffers[] = { m_VertexBuffer->GetBuffer() };
-    const VkDeviceSize offsets[] = { 0 };
-    vkCmdBindVertexBuffers(cmd, 0, 1, vertexBuffers, offsets);
+    const VkBuffer vertexBuffers[] = { m_VertexBuffer->GetBuffer(), m_InstanceBuffers[m_CurrentFrame]->GetBuffer() };
+    const VkDeviceSize offsets[] = { 0, 0 };
+    vkCmdBindVertexBuffers(cmd, 0, 2, vertexBuffers, offsets);
     vkCmdBindIndexBuffer(cmd, m_IndexBuffer->GetBuffer(), 0, VK_INDEX_TYPE_UINT16);
 
     vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_Pipeline->GetLayout(), 0, 1,
@@ -451,14 +466,10 @@ void Application::RenderFrame() {
     vkCmdSetScissor(cmd, 0, 1, &scissor);
 
     // All instances share the single bound vertex/index buffer and
-    // descriptor set (only view/proj/texture live there now) — only the
-    // model matrix varies per instance, pushed right before its own draw.
-    const float time = static_cast<float>(glfwGetTime());
-    for (std::size_t i = 0; i < kInstanceCount; ++i) {
-        const ModelPushConstant push{ ComputeInstanceModel(i, time) };
-        vkCmdPushConstants(cmd, m_Pipeline->GetLayout(), VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof(push), &push);
-        vkCmdDrawIndexed(cmd, 6, 1, 0, 0, 0);
-    }
+    // descriptor set (only view/proj/texture live there now); per-instance
+    // model matrices come from the bound instance buffer (binding 1),
+    // advancing automatically per gl_InstanceIndex — one real instanced draw.
+    vkCmdDrawIndexed(cmd, 6, static_cast<std::uint32_t>(kInstanceCount), 0, 0, 0);
 
     vkCmdEndRendering(cmd);
 

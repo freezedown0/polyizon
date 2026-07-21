@@ -8,15 +8,17 @@ namespace polyizon {
 
 // Fixed graphics pipeline for the current multi-instance quad scene: one
 // descriptor set binding a shared view/proj uniform buffer + texture
-// sampler (see uniform_buffer_object.hpp), plus a per-object model-matrix
-// push constant so multiple instances can share this one pipeline/descriptor
-// set while each still gets its own transform. Fixed Vertex layout (see
-// vertex.hpp) bound as a single vertex buffer. Built once for dynamic
-// rendering (VkPipelineRenderingCreateInfo, no VkRenderPass/VkFramebuffer)
-// and never recreated on resize: viewport/scissor are dynamic pipeline
-// state, set per-frame in Application::RenderFrame() from the current
-// swapchain extent — only the swapchain itself (and its depth buffer)
-// reacts to resize.
+// sampler (see uniform_buffer_object.hpp), and two vertex input bindings —
+// binding 0 is per-vertex Vertex data (see vertex.hpp), binding 1 is
+// per-instance model-matrix data (4 vec4 attributes, one per mat4 column,
+// reassembled in the shader) advancing once per instance
+// (VK_VERTEX_INPUT_RATE_INSTANCE). All instances are drawn with a single
+// vkCmdDrawIndexed call whose instanceCount covers them — no push constants
+// involved. Built once for dynamic rendering (VkPipelineRenderingCreateInfo,
+// no VkRenderPass/VkFramebuffer) and never recreated on resize:
+// viewport/scissor are dynamic pipeline state, set per-frame in
+// Application::RenderFrame() from the current swapchain extent — only the
+// swapchain itself (and its depth buffer) reacts to resize.
 class GraphicsPipeline {
 public:
     GraphicsPipeline(VkDevice device, VkFormat colorAttachmentFormat, VkFormat depthAttachmentFormat);

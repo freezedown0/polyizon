@@ -56,6 +56,7 @@ private:
     void CreateDescriptorResources();
     void DestroyDescriptorResources();
     void UpdateUniformBuffer(std::uint32_t frameIndex, VkExtent2D extent);
+    void UpdateInstanceBuffer(std::uint32_t frameIndex, float time);
     void RenderFrame();
 
     static constexpr std::uint32_t kMaxFramesInFlight = 2;
@@ -95,6 +96,14 @@ private:
     // reverse-declaration-order destruction.
     std::unique_ptr<Buffer> m_VertexBuffer;
     std::unique_ptr<Buffer> m_IndexBuffer;
+
+    // Per-frame-in-flight instance-transform buffers (pipeline binding 1),
+    // host-visible and re-Upload()ed every frame in RenderFrame() — grouped
+    // here with the other buffers bound at draw time, even though its
+    // upload pattern (rewritten every frame) matches m_UniformBuffers below
+    // rather than the static geometry beside it. Same destruction-order
+    // requirement as m_VertexBuffer/m_IndexBuffer.
+    std::array<std::unique_ptr<Buffer>, kMaxFramesInFlight> m_InstanceBuffers;
 
     // Per-frame-in-flight UBO buffers (host-visible, re-Upload()ed every
     // frame in RenderFrame()) and the descriptor sets that point at them.

@@ -1,11 +1,13 @@
 #include "polyizon/vulkan/pipeline.hpp"
 
-#include "polyizon/vulkan/uniform_buffer_object.hpp"
 #include "polyizon/vulkan/vertex.hpp"
+
+#include <glm/glm.hpp>
 
 #define WIN32_LEAN_AND_MEAN
 #include <Windows.h>
 
+#include <algorithm>
 #include <array>
 #include <cstdint>
 #include <filesystem>
@@ -84,20 +86,14 @@ void GraphicsPipeline::CreateDescriptorSetLayout() {
 }
 
 void GraphicsPipeline::CreatePipelineLayout() {
-    VkPushConstantRange pushConstantRange{};
-    pushConstantRange.stageFlags = VK_SHADER_STAGE_VERTEX_BIT;
-    pushConstantRange.offset = 0;
-    pushConstantRange.size = sizeof(ModelPushConstant);
-
     VkPipelineLayoutCreateInfo layoutInfo{};
     layoutInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
     // One set: the shared per-frame view/proj UBO + texture sampler (see
-    // CreateDescriptorSetLayout()). One push constant range: the per-object
-    // model matrix, re-pushed before each instance's draw call.
+    // CreateDescriptorSetLayout()). No push constants: the per-object model
+    // matrix arrives via a per-instance vertex attribute instead (see
+    // CreatePipeline()'s vertex input state).
     layoutInfo.setLayoutCount = 1;
     layoutInfo.pSetLayouts = &m_DescriptorSetLayout;
-    layoutInfo.pushConstantRangeCount = 1;
-    layoutInfo.pPushConstantRanges = &pushConstantRange;
 
     if (vkCreatePipelineLayout(m_Device, &layoutInfo, nullptr, &m_Layout) != VK_SUCCESS) {
         throw std::runtime_error("Failed to create Vulkan pipeline layout");
@@ -126,13 +122,35 @@ void GraphicsPipeline::CreatePipeline(VkFormat colorAttachmentFormat, VkFormat d
 
     const std::array<VkPipelineShaderStageCreateInfo, 2> stages = { vertStage, fragStage };
 
-    const VkVertexInputBindingDescription bindingDescription = Vertex::GetBindingDescription();
-    const auto attributeDescriptions = Vertex::GetAttributeDescriptions();
+    const VkVertexInputBindingDescription vertexBinding = Vertex::GetBindingDescription();
+    const auto vertexAttributes = Vertex::GetAttributeDescriptions();
+
+    // Per-instance model-matrix data: a mat4 can't fit in a single vertex
+    // attribute (max vec4), so it's split across 4 consecutive locations,
+    // one per column, reassembled in the shader via mat4(col0,col1,col2,col3).
+    VkVertexInputBindingDescription instanceBinding{};
+    instanceBinding.binding = 1;
+    instanceBinding.stride = sizeof(glm::mat4);
+    instanceBinding.inputRate = VK_VERTEX_INPUT_RATE_INSTANCE;
+
+    std::array<VkVertexInputAttributeDescription, 4> instanceAttributes{};
+    for (std::uint32_t col = 0; col < 4; ++col) {
+        instanceAttributes[col].location = 3 + col;
+        instanceAttributes[col].binding = 1;
+        instanceAttributes[col].format = VK_FORMAT_R32G32B32A32_SFLOAT;
+        instanceAttributes[col].offset = static_cast<std::uint32_t>(sizeof(glm::vec4)) * col;
+    }
+
+    const std::array<VkVertexInputBindingDescription, 2> bindingDescriptions = { vertexBinding, instanceBinding };
+
+    std::array<VkVertexInputAttributeDescription, 7> attributeDescriptions{};
+    std::copy(vertexAttributes.begin(), vertexAttributes.end(), attributeDescriptions.begin());
+    std::copy(instanceAttributes.begin(), instanceAttributes.end(), attributeDescriptions.begin() + 3);
 
     VkPipelineVertexInputStateCreateInfo vertexInput{};
     vertexInput.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
-    vertexInput.vertexBindingDescriptionCount = 1;
-    vertexInput.pVertexBindingDescriptions = &bindingDescription;
+    vertexInput.vertexBindingDescriptionCount = static_cast<std::uint32_t>(bindingDescriptions.size());
+    vertexInput.pVertexBindingDescriptions = bindingDescriptions.data();
     vertexInput.vertexAttributeDescriptionCount = static_cast<std::uint32_t>(attributeDescriptions.size());
     vertexInput.pVertexAttributeDescriptions = attributeDescriptions.data();
 
