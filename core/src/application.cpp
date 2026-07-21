@@ -4,6 +4,12 @@
 
 #include <glm/gtc/matrix_transform.hpp>
 
+#pragma warning(push, 0)
+#include <imgui.h>
+#include <imgui_impl_glfw.h>
+#include <imgui_impl_vulkan.h>
+#pragma warning(pop)
+
 #include <algorithm>
 #include <array>
 #include <cstddef>
@@ -54,6 +60,12 @@ glm::mat4 ComputeInstanceModel(std::size_t index, float time) {
     return glm::translate(glm::mat4(1.0f), kInstancePositions[index]) * rotation;
 }
 
+void CheckImGuiVulkanResult(VkResult result) {
+    if (result != VK_SUCCESS) {
+        throw std::runtime_error("ImGui Vulkan backend call failed");
+    }
+}
+
 } // namespace
 
 Application::Application(const ApplicationSpec& spec) {
@@ -72,6 +84,10 @@ Application::Application(const ApplicationSpec& spec) {
         OnKey(key, scancode, action, mods);
     });
     m_Window->SetCursorPosCallback([this](double x, double y) { OnCursorPos(x, y); });
+    m_Window->SetMouseButtonCallback([this](int button, int action, int mods) { OnMouseButton(button, action, mods); });
+    m_Window->SetScrollCallback([this](double xOffset, double yOffset) { OnScroll(xOffset, yOffset); });
+    m_Window->SetFocusCallback([this](int focused) { OnWindowFocus(focused); });
+    m_Window->SetCursorEnterCallback([this](int entered) { OnCursorEnter(entered); });
     m_Window->SetCursorCaptured(true); // start in FPS mouse-look mode; Escape toggles capture
 
     m_VulkanContext = std::make_unique<VulkanContext>(*m_Window, spec.name);
@@ -94,6 +110,7 @@ Application::Application(const ApplicationSpec& spec) {
     }
 
     CreateFrameSyncObjects();
+    InitImGui();
 }
 
 Application::~Application() {
@@ -103,6 +120,7 @@ Application::~Application() {
     if (m_VulkanContext) {
         vkDeviceWaitIdle(m_VulkanContext->GetDevice());
     }
+    ShutdownImGui();
     DestroyFrameSyncObjects();
     DestroyDescriptorResources();
 }
@@ -145,14 +163,25 @@ void Application::OnWindowClose() {
     Stop();
 }
 
-void Application::OnKey(int key, int /*scancode*/, int action, int /*mods*/) {
+void Application::OnKey(int key, int scancode, int action, int mods) {
     if (key == GLFW_KEY_ESCAPE && action == GLFW_PRESS) {
         m_Window->SetCursorCaptured(!m_Window->IsCursorCaptured());
         m_FirstMouseSample = true; // avoid a look-jump when re-capturing
     }
+    ImGui_ImplGlfw_KeyCallback(m_Window->GetNativeHandle(), key, scancode, action, mods);
 }
 
 void Application::OnCursorPos(double x, double y) {
+    // While released (post-Escape), the cursor reports real absolute
+    // positions — forward those to ImGui and skip the camera entirely.
+    // While captured, GLFW_CURSOR_DISABLED gives virtual/unbounded deltas
+    // meant only for the camera's relative look, which would look like
+    // garbage absolute coordinates to ImGui.
+    if (!m_Window->IsCursorCaptured()) {
+        ImGui_ImplGlfw_CursorPosCallback(m_Window->GetNativeHandle(), x, y);
+        return;
+    }
+
     if (m_FirstMouseSample) {
         m_LastMouseX = x;
         m_LastMouseY = y;
@@ -164,13 +193,31 @@ void Application::OnCursorPos(double x, double y) {
     const float yOffset = static_cast<float>(m_LastMouseY - y); // inverted: screen Y grows downward
     m_LastMouseX = x;
     m_LastMouseY = y;
+    m_Camera.ProcessMouseMovement(xOffset, yOffset);
+}
 
-    if (m_Window->IsCursorCaptured()) {
-        m_Camera.ProcessMouseMovement(xOffset, yOffset);
-    }
+void Application::OnMouseButton(int button, int action, int mods) {
+    ImGui_ImplGlfw_MouseButtonCallback(m_Window->GetNativeHandle(), button, action, mods);
+}
+
+void Application::OnScroll(double xOffset, double yOffset) {
+    ImGui_ImplGlfw_ScrollCallback(m_Window->GetNativeHandle(), xOffset, yOffset);
+}
+
+void Application::OnWindowFocus(int focused) {
+    ImGui_ImplGlfw_WindowFocusCallback(m_Window->GetNativeHandle(), focused);
+}
+
+void Application::OnCursorEnter(int entered) {
+    ImGui_ImplGlfw_CursorEnterCallback(m_Window->GetNativeHandle(), entered);
 }
 
 void Application::ProcessCameraKeyboardInput(float deltaTime) {
+    // Cursor released: the user is interacting with the ImGui overlay, not
+    // flying the camera.
+    if (!m_Window->IsCursorCaptured()) {
+        return;
+    }
     // Skip while unfocused: GLFW can leave glfwGetKey() reporting a stale
     // GLFW_PRESS for a key released while the window lacked focus (no
     // release event was ever delivered), which would otherwise look like a
@@ -367,6 +414,12 @@ void Application::RenderFrame() {
     UpdateUniformBuffer(m_CurrentFrame, extent);
     UpdateInstanceBuffer(m_CurrentFrame, time);
 
+    ImGui_ImplVulkan_NewFrame();
+    ImGui_ImplGlfw_NewFrame();
+    ImGui::NewFrame();
+    BuildDebugOverlay();
+    ImGui::Render();
+
     VkCommandBuffer cmd = m_CommandBuffers[m_CurrentFrame];
     vkResetCommandBuffer(cmd, 0);
 
@@ -471,6 +524,10 @@ void Application::RenderFrame() {
     // advancing automatically per gl_InstanceIndex — one real instanced draw.
     vkCmdDrawIndexed(cmd, 6, static_cast<std::uint32_t>(kInstanceCount), 0, 0, 0);
 
+    // Shares the already-open rendering scope/attachments — no separate
+    // begin/end needed for the debug overlay.
+    ImGui_ImplVulkan_RenderDrawData(ImGui::GetDrawData(), cmd);
+
     vkCmdEndRendering(cmd);
 
     VkImageMemoryBarrier2 toPresent = toColorAttachment;
@@ -522,6 +579,57 @@ void Application::RenderFrame() {
     m_Swapchain->Present(renderFinished, imageIndex);
 
     m_CurrentFrame = (m_CurrentFrame + 1) % kMaxFramesInFlight;
+}
+
+void Application::InitImGui() {
+    IMGUI_CHECKVERSION();
+    ImGui::CreateContext();
+    ImGui::StyleColorsDark();
+    if (!ImGui_ImplGlfw_InitForVulkan(m_Window->GetNativeHandle(), /*install_callbacks=*/false)) {
+        throw std::runtime_error("Failed to initialize ImGui GLFW backend");
+    }
+
+    const VkFormat colorFormat = m_Swapchain->GetImageFormat();
+    VkPipelineRenderingCreateInfo pipelineRenderingInfo{};
+    pipelineRenderingInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO;
+    pipelineRenderingInfo.colorAttachmentCount = 1;
+    pipelineRenderingInfo.pColorAttachmentFormats = &colorFormat;
+    pipelineRenderingInfo.depthAttachmentFormat = m_Swapchain->GetDepthFormat();
+
+    ImGui_ImplVulkan_InitInfo initInfo{};
+    initInfo.ApiVersion = VK_API_VERSION_1_3;
+    initInfo.Instance = m_VulkanContext->GetInstance();
+    initInfo.PhysicalDevice = m_VulkanContext->GetPhysicalDevice();
+    initInfo.Device = m_VulkanContext->GetDevice();
+    initInfo.QueueFamily = m_VulkanContext->GetGraphicsQueueFamily();
+    initInfo.Queue = m_VulkanContext->GetGraphicsQueue();
+    initInfo.DescriptorPoolSize = 16; // convenience: backend creates+owns its own small pool, comfortably above the documented 8/2 minimums
+    initInfo.MinImageCount = m_Swapchain->GetImageCount();
+    initInfo.ImageCount = m_Swapchain->GetImageCount();
+    initInfo.UseDynamicRendering = true;
+    initInfo.PipelineInfoMain.PipelineRenderingCreateInfo = pipelineRenderingInfo;
+    initInfo.CheckVkResultFn = CheckImGuiVulkanResult;
+
+    if (!ImGui_ImplVulkan_Init(&initInfo)) {
+        throw std::runtime_error("Failed to initialize ImGui Vulkan backend");
+    }
+}
+
+void Application::ShutdownImGui() {
+    ImGui_ImplVulkan_Shutdown();
+    ImGui_ImplGlfw_Shutdown();
+    ImGui::DestroyContext();
+}
+
+void Application::BuildDebugOverlay() {
+    ImGui::Begin("Debug Overlay");
+    const ImGuiIO& io = ImGui::GetIO();
+    ImGui::Text("FPS: %.1f (%.3f ms/frame)", io.Framerate, 1000.0f / io.Framerate);
+    const glm::vec3 pos = m_Camera.GetPosition();
+    ImGui::Text("Camera position: (%.2f, %.2f, %.2f)", pos.x, pos.y, pos.z);
+    ImGui::SliderFloat("Move speed", &m_Camera.movementSpeed, 0.5f, 10.0f);
+    ImGui::SliderFloat("Mouse sensitivity", &m_Camera.mouseSensitivity, 0.01f, 0.5f);
+    ImGui::End();
 }
 
 } // namespace polyizon

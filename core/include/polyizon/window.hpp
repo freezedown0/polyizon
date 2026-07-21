@@ -25,6 +25,8 @@ public:
     using MouseButtonCallback = std::function<void(int button, int action, int mods)>;
     using CursorPosCallback = std::function<void(double x, double y)>;
     using ScrollCallback = std::function<void(double xOffset, double yOffset)>;
+    using FocusCallback = std::function<void(int focused)>;
+    using CursorEnterCallback = std::function<void(int entered)>;
 
     explicit Window(const WindowProps& props = {});
     ~Window();
@@ -49,6 +51,8 @@ public:
     void SetMouseButtonCallback(MouseButtonCallback callback);
     void SetCursorPosCallback(CursorPosCallback callback);
     void SetScrollCallback(ScrollCallback callback);
+    void SetFocusCallback(FocusCallback callback);
+    void SetCursorEnterCallback(CursorEnterCallback callback);
 
     // Hides + locks the cursor to the window with unbounded virtual-position
     // tracking (GLFW_CURSOR_DISABLED) for FPS-style mouse look, or restores
@@ -70,6 +74,8 @@ private:
         MouseButtonCallback onMouseButton;
         CursorPosCallback onCursorPos;
         ScrollCallback onScroll;
+        FocusCallback onFocus;
+        CursorEnterCallback onCursorEnter;
     };
 
     void InstallCallbacks();

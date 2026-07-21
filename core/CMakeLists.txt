@@ -10,6 +10,8 @@ target_include_directories(polyizon_core
     PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/src
         ${Stb_INCLUDE_DIR}
+        # Vendored imgui_impl_vulkan (see target_sources below for why).
+        ${CMAKE_SOURCE_DIR}/third_party/imgui_impl_vulkan
 )
 
 # Source files
@@ -26,6 +28,26 @@ target_sources(polyizon_core
         src/vulkan/pipeline.cpp
         src/vulkan/buffer.cpp
         src/vulkan/image.cpp
+
+        # Vendored imgui_impl_vulkan.cpp (see third_party/imgui_impl_vulkan/):
+        # vcpkg's imgui port is installed WITHOUT its vulkan-binding feature
+        # on purpose. That prebuilt backend calls plain <vulkan/vulkan.h>
+        # functions directly, which collide at link time with this project's
+        # volk setup (context.cpp's VOLK_IMPLEMENTATION defines global
+        # PFN_vk*-typed variables using the exact same names as the real
+        # Vulkan functions — vkCreateInstance, vkCreateDescriptorPool, etc.
+        # With both linked into one binary, the linker resolves the prebuilt
+        # backend's direct function calls against our volk data variables
+        # instead of the real vulkan-1.dll exports, which crashes immediately
+        # (confirmed: the linked .exe imported zero functions from
+        # vulkan-1.dll, and the backend's first real Vulkan call crashed with
+        # an access violation, deterministically, at Application::InitImGui).
+        # The fix is imgui's own documented interop path (IMGUI_IMPL_VULKAN_USE_VOLK,
+        # see imgui_impl_vulkan.h's "Convenience support for Volk" section):
+        # compile the backend ourselves with that define so it goes through
+        # <volk.h> instead, sharing our exact same global function pointers —
+        # no separate/duplicate/colliding symbol names.
+        ${CMAKE_SOURCE_DIR}/third_party/imgui_impl_vulkan/imgui_impl_vulkan.cpp
 
         # Rendering subsystem (not yet implemented)
         # src/rendering/renderer.cpp
@@ -44,6 +66,12 @@ target_link_libraries(polyizon_core
         Vulkan::Vulkan
         glm::glm
         EnTT::EnTT
+        # imgui::imgui bundles the compiled glfw backend (installed with the
+        # glfw-binding vcpkg feature). The vulkan backend is deliberately
+        # NOT installed via vcpkg's vulkan-binding feature — see the
+        # target_sources comment above for why it's vendored/compiled
+        # ourselves instead.
+        imgui::imgui
         # volk::volk (the precompiled static lib) is deliberately NOT linked:
         # it reliably crashed inside its own genload code on this machine even
         # though the Vulkan driver/loader and GLFW's loader path both work
@@ -65,6 +93,11 @@ endif()
 if(POLYIZON_ENABLE_PROFILING)
     target_compile_definitions(polyizon_core PUBLIC POLYIZON_ENABLE_PROFILING)
 endif()
+
+# Makes both the vendored imgui_impl_vulkan.cpp and our own code's inclusion
+# of its header go through <volk.h> instead of <vulkan/vulkan.h> — see the
+# target_sources comment above for why this must be consistent project-wide.
+target_compile_definitions(polyizon_core PRIVATE IMGUI_IMPL_VULKAN_USE_VOLK)
 
 # Vulkan uses a [0,1] clip-space depth range and Y-down NDC; GLM defaults to
 # OpenGL conventions ([-1,1] depth). Set as compiler-level defines rather
