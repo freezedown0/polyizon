@@ -37,3 +37,7 @@ target_compile_features(polyizon_editor PRIVATE cxx_std_20)
 set_target_properties(polyizon_editor PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
 )
+
+# Application icon (window/taskbar/Explorer)
+include(AppIcon)
+polyizon_add_app_icon(polyizon_editor "${CMAKE_SOURCE_DIR}/resources/Polyizon.ico")
