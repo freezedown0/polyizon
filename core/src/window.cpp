@@ -110,6 +110,14 @@ void Window::SetMouseButtonCallback(MouseButtonCallback callback) { m_Data.onMou
 void Window::SetCursorPosCallback(CursorPosCallback callback) { m_Data.onCursorPos = std::move(callback); }
 void Window::SetScrollCallback(ScrollCallback callback) { m_Data.onScroll = std::move(callback); }
 
+void Window::SetCursorCaptured(bool captured) {
+    glfwSetInputMode(m_Handle, GLFW_CURSOR, captured ? GLFW_CURSOR_DISABLED : GLFW_CURSOR_NORMAL);
+}
+
+bool Window::IsCursorCaptured() const {
+    return glfwGetInputMode(m_Handle, GLFW_CURSOR) == GLFW_CURSOR_DISABLED;
+}
+
 void Window::InstallCallbacks() {
     glfwSetFramebufferSizeCallback(m_Handle, [](GLFWwindow* window, int width, int height) {
         auto& data = *static_cast<WindowData*>(glfwGetWindowUserPointer(window));

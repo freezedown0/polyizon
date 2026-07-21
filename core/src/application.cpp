@@ -4,6 +4,7 @@
 
 #include <glm/gtc/matrix_transform.hpp>
 
+#include <algorithm>
 #include <array>
 #include <cstddef>
 #include <cstdint>
@@ -67,6 +68,11 @@ Application::Application(const ApplicationSpec& spec) {
     m_Window->SetResizeCallback([this](std::uint32_t width, std::uint32_t height) {
         OnWindowResize(width, height);
     });
+    m_Window->SetKeyCallback([this](int key, int scancode, int action, int mods) {
+        OnKey(key, scancode, action, mods);
+    });
+    m_Window->SetCursorPosCallback([this](double x, double y) { OnCursorPos(x, y); });
+    m_Window->SetCursorCaptured(true); // start in FPS mouse-look mode; Escape toggles capture
 
     m_VulkanContext = std::make_unique<VulkanContext>(*m_Window, spec.name);
     m_Swapchain = std::make_unique<Swapchain>(*m_VulkanContext, *m_Window);
@@ -101,10 +107,11 @@ void Application::Run() {
 
     while (m_Running && !m_Window->ShouldClose()) {
         const float time = static_cast<float>(glfwGetTime());
-        const float deltaTime = time - m_LastFrameTime;
+        const float deltaTime = std::min(time - m_LastFrameTime, kMaxDeltaTime);
         m_LastFrameTime = time;
 
         m_Window->PollEvents();
+        ProcessCameraKeyboardInput(deltaTime);
         OnUpdate(deltaTime);
         RenderFrame();
     }
@@ -131,6 +138,42 @@ void Application::OnWindowResize(std::uint32_t /*width*/, std::uint32_t /*height
 
 void Application::OnWindowClose() {
     Stop();
+}
+
+void Application::OnKey(int key, int /*scancode*/, int action, int /*mods*/) {
+    if (key == GLFW_KEY_ESCAPE && action == GLFW_PRESS) {
+        m_Window->SetCursorCaptured(!m_Window->IsCursorCaptured());
+        m_FirstMouseSample = true; // avoid a look-jump when re-capturing
+    }
+}
+
+void Application::OnCursorPos(double x, double y) {
+    if (m_FirstMouseSample) {
+        m_LastMouseX = x;
+        m_LastMouseY = y;
+        m_FirstMouseSample = false;
+        return;
+    }
+
+    const float xOffset = static_cast<float>(x - m_LastMouseX);
+    const float yOffset = static_cast<float>(m_LastMouseY - y); // inverted: screen Y grows downward
+    m_LastMouseX = x;
+    m_LastMouseY = y;
+
+    if (m_Window->IsCursorCaptured()) {
+        m_Camera.ProcessMouseMovement(xOffset, yOffset);
+    }
+}
+
+void Application::ProcessCameraKeyboardInput(float deltaTime) {
+    // Skip while unfocused: GLFW can leave glfwGetKey() reporting a stale
+    // GLFW_PRESS for a key released while the window lacked focus (no
+    // release event was ever delivered), which would otherwise look like a
+    // stuck movement key when focus returns.
+    if (glfwGetWindowAttrib(m_Window->GetNativeHandle(), GLFW_FOCUSED) == GLFW_FALSE) {
+        return;
+    }
+    m_Camera.ProcessKeyboard(m_Window->GetNativeHandle(), deltaTime);
 }
 
 void Application::CreateFrameSyncObjects() {
@@ -279,7 +322,7 @@ void Application::DestroyDescriptorResources() {
 
 void Application::UpdateUniformBuffer(std::uint32_t frameIndex, VkExtent2D extent) {
     UniformBufferObject ubo{};
-    ubo.view = glm::lookAt(glm::vec3(0.0f, 0.0f, 2.0f), glm::vec3(0.0f), glm::vec3(0.0f, 1.0f, 0.0f));
+    ubo.view = m_Camera.GetViewMatrix();
 
     const float aspect = static_cast<float>(extent.width) / static_cast<float>(extent.height);
     ubo.proj = glm::perspective(glm::radians(45.0f), aspect, 0.1f, 10.0f);

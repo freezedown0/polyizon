@@ -1,5 +1,6 @@
 #pragma once
 
+#include "polyizon/camera.hpp"
 #include "polyizon/vulkan/buffer.hpp"
 #include "polyizon/vulkan/context.hpp"
 #include "polyizon/vulkan/image.hpp"
@@ -46,6 +47,9 @@ protected:
 private:
     void OnWindowResize(std::uint32_t width, std::uint32_t height);
     void OnWindowClose();
+    void OnKey(int key, int scancode, int action, int mods);
+    void OnCursorPos(double x, double y);
+    void ProcessCameraKeyboardInput(float deltaTime);
 
     void CreateFrameSyncObjects();
     void DestroyFrameSyncObjects();
@@ -55,6 +59,7 @@ private:
     void RenderFrame();
 
     static constexpr std::uint32_t kMaxFramesInFlight = 2;
+    static constexpr float kMaxDeltaTime = 0.1f; // clamp for stalls (window drag-resize, debugger pause, etc.)
 
     std::unique_ptr<Window> m_Window;
     // Declared after m_Window so it's destroyed first (reverse declaration
@@ -112,6 +117,15 @@ private:
 
     bool m_Running = true;
     float m_LastFrameTime = 0.0f;
+
+    // Free-fly camera driving the view matrix (see UpdateUniformBuffer()).
+    // Owns no GPU/GLFW resource, so its declaration position here has no
+    // destruction-order implications. Default-constructed state reproduces
+    // the previous hardcoded eye=(0,0,2) lookAt(origin) exactly.
+    Camera m_Camera;
+    double m_LastMouseX = 0.0;
+    double m_LastMouseY = 0.0;
+    bool m_FirstMouseSample = true;
 };
 
 } // namespace polyizon

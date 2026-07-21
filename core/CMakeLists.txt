@@ -18,6 +18,7 @@ target_sources(polyizon_core
         # Application/window lifecycle
         src/window.cpp
         src/application.cpp
+        src/camera.cpp
 
         # Vulkan abstraction layer
         src/vulkan/context.cpp

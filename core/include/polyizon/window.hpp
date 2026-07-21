@@ -50,6 +50,12 @@ public:
     void SetCursorPosCallback(CursorPosCallback callback);
     void SetScrollCallback(ScrollCallback callback);
 
+    // Hides + locks the cursor to the window with unbounded virtual-position
+    // tracking (GLFW_CURSOR_DISABLED) for FPS-style mouse look, or restores
+    // the normal visible/unconstrained cursor.
+    void SetCursorCaptured(bool captured);
+    bool IsCursorCaptured() const;
+
 private:
     // Lives at a stable address (glfwSetWindowUserPointer) so GLFW's static
     // C callbacks can reach back into the owning Window's std::function state.
