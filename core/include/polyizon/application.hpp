@@ -169,6 +169,7 @@ private:
     // Camera's movementSpeed/mouseSensitivity above.
     float m_SunElevationDegrees = 25.0f;
     float m_SunAzimuthDegrees = 0.0f;
+    float m_SkyExposure = 1.2f; // tonemap input scale (see sky.frag's ACESFilm) — fixes the sun/sky blowing out to flat white
     int m_AtmospherePrimarySteps = 16;
     int m_AtmosphereSunSteps = 8;
 
@@ -177,12 +178,15 @@ private:
     // noise UV scale are fixed constants (not exposed) — only the ones worth
     // live-tweaking for the coverage/density/wind/performance tradeoff are
     // sliders.
-    float m_CloudCoverage = 0.45f;
-    float m_CloudDensityMultiplier = 1.0f;
+    float m_CloudCoverage = 0.4f;
+    float m_CloudDensityMultiplier = 1.1f;
     float m_CloudWindSpeed = 0.02f;
     float m_CloudWindDirectionDegrees = 0.0f;
     int m_CloudPrimarySteps = 64;
-    int m_CloudSunShadowSteps = 6;
+    int m_CloudSunShadowSteps = 8;
+
+    // Distance fog for the quad scene (see UpdateUniformBuffer()/triangle.frag).
+    float m_FogDensity = 0.06f;
 };
 
 } // namespace polyizon

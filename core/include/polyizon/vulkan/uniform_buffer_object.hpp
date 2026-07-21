@@ -17,6 +17,13 @@ namespace polyizon {
 struct UniformBufferObject {
     glm::mat4 view;
     glm::mat4 proj;
+    // Distance/volumetric fog for the quads (see triangle.vert/.frag):
+    // rgb = fog color (kept close to the sky's own haze tone), a = density
+    // for the exponential falloff exp(-(dist*density)^2). Read fragment-side
+    // only, but lives in this same per-frame UBO rather than a second one —
+    // the binding's stageFlags now cover both VERTEX and FRAGMENT (see
+    // GraphicsPipeline::CreateDescriptorSetLayout()).
+    glm::vec4 fogColorAndDensity;
 };
 
 } // namespace polyizon

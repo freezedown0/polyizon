@@ -438,6 +438,11 @@ void Application::UpdateUniformBuffer(std::uint32_t frameIndex, VkExtent2D exten
     ubo.proj = glm::perspective(glm::radians(45.0f), aspect, 0.1f, 10.0f);
     ubo.proj[1][1] *= -1.0f; // Vulkan NDC is Y-down; glm::perspective assumes Y-up.
 
+    // A pale sky-blue-gray, close to a typical daytime horizon haze tone —
+    // kept fixed rather than sampled from the sky shader (the two passes
+    // don't share data), tuned by eye to blend plausibly with it.
+    ubo.fogColorAndDensity = glm::vec4(0.75f, 0.8f, 0.85f, m_FogDensity);
+
     m_UniformBuffers[frameIndex]->Upload(&ubo, sizeof(ubo));
 }
 
@@ -468,9 +473,13 @@ void Application::UpdateSkyUniformBuffer(std::uint32_t frameIndex, VkExtent2D ex
         std::sin(elevation),
         std::cos(elevation) * std::sin(azimuth))), 0.0f);
 
-    sky.timeAndSun = glm::vec4(time, glm::radians(0.5f), 0.0f, 0.0f);
+    sky.timeAndSun = glm::vec4(time, glm::radians(1.5f), 0.0f, 0.0f); // wider angular radius than the real sun (0.5deg) so it reads as a clear disk on screen
     sky.atmosphereParams0 = glm::vec4(6360.0f, 60.0f, 0.5f, 8.0f);  // planetRadius, atmosphereHeight, eyeHeight, rayleighScaleHeight (km)
-    sky.atmosphereParams1 = glm::vec4(1.2f, 0.76f, 20.0f, 0.0f);    // mieScaleHeight (km), mieG, sunIntensity
+    // mieScaleHeight (km), mieG, sunIntensity, exposure. sunIntensity/exposure
+    // are tuned together with sky.frag's ACESFilm tonemap — lower intensity
+    // than before (was 20) since the tonemap now does the brightness
+    // compression instead of relying on values clipping straight to white.
+    sky.atmosphereParams1 = glm::vec4(1.2f, 0.76f, 10.0f, m_SkyExposure);
 
     // Cloud layer: bottom/top are km above the planet surface (well within
     // the 60km atmosphere shell above); forwardG/backG give the dual-lobe
@@ -478,7 +487,7 @@ void Application::UpdateSkyUniformBuffer(std::uint32_t frameIndex, VkExtent2D ex
     // times the 128^3 noise volume tiles across the cloud layer.
     sky.cloudParams0 = glm::vec4(1.5f, 4.0f, m_CloudCoverage, m_CloudDensityMultiplier);
     sky.cloudParams1 = glm::vec4(m_CloudWindSpeed, glm::radians(m_CloudWindDirectionDegrees), 0.8f, -0.2f);
-    sky.cloudParams2 = glm::vec4(1.0f, 0.3f, 0.02f, 0.0f); // powderStrength, ambientStrength, noiseUvScale
+    sky.cloudParams2 = glm::vec4(1.0f, 0.2f, 0.02f, 0.0f); // powderStrength, ambientStrength, noiseUvScale
 
     sky.stepCounts = glm::ivec4(m_AtmospherePrimarySteps, m_AtmosphereSunSteps, m_CloudPrimarySteps, m_CloudSunShadowSteps);
 
@@ -736,9 +745,11 @@ void Application::BuildDebugOverlay() {
     ImGui::Text("Camera position: (%.2f, %.2f, %.2f)", pos.x, pos.y, pos.z);
     ImGui::SliderFloat("Move speed", &m_Camera.movementSpeed, 0.5f, 10.0f);
     ImGui::SliderFloat("Mouse sensitivity", &m_Camera.mouseSensitivity, 0.01f, 0.5f);
+    ImGui::SliderFloat("Fog density", &m_FogDensity, 0.0f, 0.5f);
     if (ImGui::CollapsingHeader("Sky", ImGuiTreeNodeFlags_DefaultOpen)) {
         ImGui::SliderFloat("Sun elevation", &m_SunElevationDegrees, -20.0f, 90.0f);
         ImGui::SliderFloat("Sun azimuth", &m_SunAzimuthDegrees, 0.0f, 360.0f);
+        ImGui::SliderFloat("Exposure", &m_SkyExposure, 0.2f, 3.0f);
         ImGui::SliderInt("Atmosphere steps", &m_AtmospherePrimarySteps, 4, 32);
         ImGui::SliderInt("Atmosphere sun steps", &m_AtmosphereSunSteps, 2, 16);
         ImGui::SliderFloat("Cloud coverage", &m_CloudCoverage, 0.0f, 1.0f);

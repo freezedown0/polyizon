@@ -135,9 +135,32 @@ float SampleCloudDensity(vec3 p, float planetR, float bottom, float top, float c
     vec4 n = texture(cloudNoise, p * noiseScale + windOffset);
     float baseShape = n.r;
     float erosion = n.g * 0.625 + n.b * 0.25 + n.a * 0.125;
-    float shaped = clamp(baseShape - (1.0 - erosion) * 0.3, 0.0, 1.0);
+    // Erode more aggressively than a flat subtraction: edges/thin regions
+    // (low baseShape) get carved away almost entirely by low erosion values,
+    // while dense cores survive — this is what turns a smooth haze into
+    // distinct, separated puffs instead of one continuous translucent layer.
+    float shaped = clamp(baseShape - (1.0 - erosion) * 0.55, 0.0, 1.0);
+    // Extra contrast: push mid/low densities down further, keep strong cores
+    // relatively intact, sharpening the visible silhouette.
+    shaped = pow(shaped, 1.6);
     float heightFraction = clamp((length(p) - (planetR + bottom)) / max(top - bottom, 0.0001), 0.0, 1.0);
     return RemapCloud(shaped, coverage, heightFraction) * densityMult;
+}
+
+// ACES filmic tonemap (Narkowicz 2015 fit): compresses unbounded HDR
+// scattering values into a displayable [0,1] range with a smooth shoulder
+// instead of hard-clipping to white. This is what actually fixes the
+// "too bright" sky — without it, any pixel whose raw scattering/sun-disk
+// value exceeds 1.0 clips to flat white over however wide an area that
+// condition holds, which reads as a giant blown-out glow instead of a
+// small, well-defined bright sun.
+vec3 ACESFilm(vec3 x) {
+    const float a = 2.51;
+    const float b = 0.03;
+    const float c = 2.43;
+    const float d = 0.59;
+    const float e = 0.14;
+    return clamp((x * (a * x + b)) / (x * (c * x + d) + e), 0.0, 1.0);
 }
 
 float HenyeyGreenstein(float mu, float g) {
@@ -199,8 +222,12 @@ vec4 RaymarchClouds(vec3 ro, vec3 rd, vec3 sunDir, float planetR, float bottom, 
         if (density > 0.001) {
             float sunT = SunShadowRaymarch(p, sunDir, planetR, bottom, top, coverage, densityMult, windOffset, noiseScale, shadowSteps);
             float powderTerm = 1.0 - exp(-density * 2.0 * powder);
-            vec3 sunColor = vec3(1.0, 0.95, 0.85) * max(sunDir.y, 0.05);
-            vec3 luminance = sunColor * phase * sunT * powderTerm + vec3(0.4, 0.5, 0.7) * ambient;
+            vec3 sunColor = vec3(1.0, 0.95, 0.85) * max(sunDir.y, 0.05) * 2.0;
+            // Ambient is intentionally weak relative to direct sun*shadow
+            // lighting: sunT alone should carve visible dark undersides vs
+            // bright, sun-facing tops. A strong flat ambient term is what
+            // flattened the earlier result into a uniform haze.
+            vec3 luminance = sunColor * phase * sunT * powderTerm + vec3(0.35, 0.4, 0.55) * ambient * (0.3 + 0.7 * sunT);
             float stepTransmittance = exp(-density * stepSize * 4.0);
             scattered += transmittance * luminance * (1.0 - stepTransmittance);
             transmittance *= stepTransmittance;
@@ -226,6 +253,7 @@ void main() {
     float mieH = sky.atmosphereParams1.x;
     float mieG = sky.atmosphereParams1.y;
     float sunIntensity = sky.atmosphereParams1.z;
+    float exposure = sky.atmosphereParams1.w;
 
     // Fixed virtual eye point, not the literal (tiny-scale) camera position —
     // see sky_uniform_buffer_object.hpp's invView comment.
@@ -237,12 +265,17 @@ void main() {
     vec3 color = ComputeAtmosphere(rayOrigin, rayDir, sunDir, planetR, planetR + atmH,
         rayleighH, mieH, betaR, betaM, mieG, sunIntensity, sky.stepCounts.x, sky.stepCounts.y);
 
-    // Sun disk: a smoothstep ring around the exact sun direction, faded by
-    // the sun's own elevation so it doesn't punch through the horizon glow
-    // at sunrise/sunset in a physically silly way.
+    // Sun disk: a soft-edged core (smoothstep across a couple degrees, not a
+    // hard cutoff) around the exact sun direction, faded by the sun's own
+    // elevation so it doesn't punch through the horizon glow at
+    // sunrise/sunset in a physically silly way. Kept moderate in raw
+    // intensity — ACESFilm below gives it a natural bright-but-bounded look
+    // instead of relying on a huge multiplier that would've just clipped to
+    // white without tonemapping.
     float sunAngularRadius = sky.timeAndSun.y;
-    float sunDisk = smoothstep(cos(sunAngularRadius), cos(sunAngularRadius * 0.9), dot(rayDir, sunDir));
-    color += sunDisk * vec3(1.0, 0.9, 0.7) * max(sunDir.y, 0.0) * 3.0;
+    float cosTheta = dot(rayDir, sunDir);
+    float sunDisk = smoothstep(cos(sunAngularRadius * 1.05), cos(sunAngularRadius * 0.85), cosTheta);
+    color += sunDisk * vec3(1.0, 0.95, 0.85) * max(sunDir.y, 0.05) * 1.5;
 
     // Dark-navy night floor so a fully-set sun doesn't read as pure black.
     color = max(color, vec3(0.0005, 0.0007, 0.0012));
@@ -260,6 +293,11 @@ void main() {
         sky.cloudParams2.x, sky.cloudParams2.y, sky.stepCounts.z, sky.stepCounts.w);
 
     color = color * clouds.a + clouds.rgb;
+
+    // Tonemap once, at the very end, over the fully composited HDR result
+    // (atmosphere + sun disk + clouds) — applying it earlier/per-term would
+    // double-compress the parts that get added afterward.
+    color = ACESFilm(color * exposure);
 
     outColor = vec4(color, 1.0);
 }
