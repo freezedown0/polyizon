@@ -1,5 +1,7 @@
 #pragma once
 
+#include "script_engine.hpp"
+
 #include "polyizon/camera.hpp"
 #include "polyizon/scene/components.hpp"
 #include "polyizon/scene/scene.hpp"
@@ -18,6 +20,7 @@
 #include <array>
 #include <chrono>
 #include <cstdint>
+#include <filesystem>
 #include <memory>
 
 namespace polyizon {
@@ -30,12 +33,15 @@ namespace polyizon {
 // this duplication (rather than a shared RenderCore base extracted from
 // Application) is the intentional choice.
 //
-// Phase 15: no longer renders the game client's hardcoded quad demo (that
-// stays exclusively on the GLFW/Application path, untouched by this phase) —
-// this class now renders its own EnTT Scene (a plane + a cube, see the
-// constructor) through a real lit-shading + shadow-mapping pipeline instead
-// of GraphicsPipeline's unlit textured quads. The sky/cloud background
-// (SkyPipeline) is unchanged.
+// Phase 15 gave this class its own EnTT Scene through a real lit-shading +
+// shadow-mapping pipeline instead of GraphicsPipeline's unlit textured
+// quads (still never rendering the game client's hardcoded quad demo, which
+// stays exclusively on the GLFW/Application path, untouched by this phase
+// too). Phase 16: m_Scene starts empty and is only ever populated via
+// LoadScene() (called from MainWindow's File > New/Open Project handlers,
+// see project.hpp/scene_serializer.hpp) — there is no hardcoded sample scene
+// built directly in this class anymore. The sky/cloud background
+// (SkyPipeline) is unchanged throughout.
 class EditorViewportRenderer {
 public:
     // hwnd/hinstance come from VulkanViewportWindow's winId()/
@@ -63,6 +69,10 @@ public:
     // by a different input system upstream (see Camera's GLFW-agnostic
     // ProcessKeyboard overload).
     void UpdateCamera(bool forward, bool backward, bool left, bool right, bool up, bool down, float deltaTime) {
+        // Cached for RenderFrame()'s ScriptEngine::Update() call — the
+        // per-frame deltaTime scripts advance by should match the camera's,
+        // not a second independently-derived value (see RenderFrame()).
+        m_LastDeltaTime = deltaTime;
         m_Camera.ProcessKeyboard(forward, backward, left, right, up, down, deltaTime);
     }
 
@@ -73,8 +83,13 @@ public:
 
     void RenderFrame();
 
+    // Called from VulkanViewportWindow (in turn from MainWindow's File >
+    // New/Open Project handlers). Waits for the GPU to finish with whatever
+    // scene is currently loaded (its entities' Mesh GPU buffers must not be
+    // in flight) before replacing m_Scene outright — see scene_serializer.hpp.
+    void LoadScene(const std::filesystem::path& sceneFile);
+
 private:
-    void BuildSampleScene();
     void CreateFrameSyncObjects();
     void DestroyFrameSyncObjects();
     void CreateDescriptorResources();
@@ -102,13 +117,15 @@ private:
     std::unique_ptr<Texture3D> m_CloudNoiseTexture;
     std::unique_ptr<ShadowMap> m_ShadowMap;
 
-    // The plane+cube sample scene (see BuildSampleScene()) and the meshes
-    // its MeshComponents reference. Meshes are owned here (not per-entity
-    // unique_ptrs) since MeshComponent holds a shared_ptr — see
-    // scene/components.hpp.
+    // Starts empty; populated only via LoadScene() (see its doc comment
+    // above). Each entity's MeshComponent owns its own Mesh shared_ptr (see
+    // scene/components.hpp) — no plane/cube-specific members here anymore.
     Scene m_Scene;
-    std::shared_ptr<Mesh> m_PlaneMesh;
-    std::shared_ptr<Mesh> m_CubeMesh;
+
+    // Lua scripting (Phase 16) — ScriptEngine owns the shared Lua state and
+    // per-script environments; touches no Vulkan/GPU state, so its
+    // declaration position here has no destruction-order implications.
+    ScriptEngine m_ScriptEngine;
 
     std::array<std::unique_ptr<Buffer>, kMaxFramesInFlight> m_LitUniformBuffers;
     VkDescriptorPool m_DescriptorPool = VK_NULL_HANDLE;
@@ -132,6 +149,10 @@ private:
     // clock instead, used for the same cloud wind-scroll/sun-disk shader
     // params Application derives from glfwGetTime().
     std::chrono::steady_clock::time_point m_ClockStart = std::chrono::steady_clock::now();
+
+    // Cached by UpdateCamera() each frame, read by RenderFrame() when
+    // calling ScriptEngine::Update() — see UpdateCamera()'s doc comment.
+    float m_LastDeltaTime = 0.0f;
 
     Camera m_Camera;
 

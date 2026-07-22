@@ -35,6 +35,21 @@ void VulkanViewportWindow::exposeEvent(QExposeEvent* event) {
         m_Renderer = std::make_unique<polyizon::EditorViewportRenderer>(
             hwnd, hinstance, static_cast<std::uint32_t>(width()), static_cast<std::uint32_t>(height()));
         m_LastFrameTime = std::chrono::steady_clock::now();
+
+        // Apply whatever scene was requested (via LoadScene()) before the
+        // renderer existed to construct against.
+        if (m_PendingScenePath.has_value()) {
+            m_Renderer->LoadScene(*m_PendingScenePath);
+            m_PendingScenePath.reset();
+        }
+    }
+}
+
+void VulkanViewportWindow::LoadScene(const std::filesystem::path& sceneFile) {
+    if (m_Renderer) {
+        m_Renderer->LoadScene(sceneFile);
+    } else {
+        m_PendingScenePath = sceneFile;
     }
 }
 

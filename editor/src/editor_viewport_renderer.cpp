@@ -1,13 +1,10 @@
 #include "editor_viewport_renderer.hpp"
 
-#include "mesh_import.hpp"
+#include "scene_serializer.hpp"
 
 #include "polyizon/noise.hpp"
 
 #include <glm/gtc/matrix_transform.hpp>
-
-#define WIN32_LEAN_AND_MEAN
-#include <Windows.h>
 
 #include <array>
 #include <cmath>
@@ -16,23 +13,6 @@
 #include <stdexcept>
 
 namespace polyizon {
-
-namespace {
-
-// Resolved relative to the running executable's own directory, matching
-// every other class's identical private helper (Image, GraphicsPipeline,
-// etc.) — duplicated here rather than shared for the same reason they
-// duplicate it from each other.
-std::filesystem::path GetExecutableDirectory() {
-    wchar_t buffer[MAX_PATH];
-    const DWORD length = GetModuleFileNameW(nullptr, buffer, MAX_PATH);
-    if (length == 0 || length == MAX_PATH) {
-        throw std::runtime_error("Failed to resolve executable directory");
-    }
-    return std::filesystem::path(buffer).parent_path();
-}
-
-} // namespace
 
 EditorViewportRenderer::EditorViewportRenderer(HWND hwnd, HINSTANCE hinstance, std::uint32_t width, std::uint32_t height) {
     m_VulkanContext = std::make_unique<VulkanContext>(hwnd, hinstance, "Polyizon Editor");
@@ -52,7 +32,10 @@ EditorViewportRenderer::EditorViewportRenderer(HWND hwnd, HINSTANCE hinstance, s
     // ShadowMap's constructor comment) rather than re-deriving it.
     m_ShadowMap = std::make_unique<ShadowMap>(*m_VulkanContext, m_Swapchain->GetDepthFormat(), kShadowMapResolution);
 
-    BuildSampleScene(); // must precede CreateDescriptorResources(): none of it touches descriptors, but keeps mesh/scene setup grouped before GPU descriptor wiring
+    // m_Scene starts empty (default-constructed) — populated only via a
+    // later LoadScene() call, once MainWindow's File > New/Open Project
+    // handler has a project/scene file to point at. Until then the viewport
+    // just shows the sky/cloud background with nothing in it.
 
     CreateDescriptorResources();
     CreateFrameSyncObjects();
@@ -68,28 +51,13 @@ EditorViewportRenderer::~EditorViewportRenderer() {
     DestroyDescriptorResources();
 }
 
-void EditorViewportRenderer::BuildSampleScene() {
-    const std::filesystem::path modelsDir = GetExecutableDirectory() / "models";
-    m_PlaneMesh = LoadMesh(*m_VulkanContext, modelsDir / "plane.obj");
-    m_CubeMesh = LoadMesh(*m_VulkanContext, modelsDir / "cube.obj");
-
-    // Ground plane at the origin — plane.obj is already a flat 10x10 quad in
-    // the XZ plane (see core/models/plane.obj), no transform needed beyond
-    // the identity default.
-    const entt::entity planeEntity = m_Scene.CreateEntity();
-    m_Scene.GetRegistry().emplace<TransformComponent>(planeEntity);
-    m_Scene.GetRegistry().emplace<MeshComponent>(planeEntity, m_PlaneMesh);
-    m_Scene.GetRegistry().emplace<MaterialComponent>(planeEntity, glm::vec3(0.3f, 0.6f, 0.25f)); // grass-ish green
-
-    // Cube resting on the plane: cube.obj is a unit cube centered at its own
-    // local origin (spans -0.5..0.5), so position.y=0.5 puts its bottom face
-    // exactly at the plane's y=0 — the actual shadow-mapping test case.
-    const entt::entity cubeEntity = m_Scene.CreateEntity();
-    TransformComponent cubeTransform;
-    cubeTransform.position = glm::vec3(0.0f, 0.5f, 0.0f);
-    m_Scene.GetRegistry().emplace<TransformComponent>(cubeEntity, cubeTransform);
-    m_Scene.GetRegistry().emplace<MeshComponent>(cubeEntity, m_CubeMesh);
-    m_Scene.GetRegistry().emplace<MaterialComponent>(cubeEntity, glm::vec3(0.8f, 0.8f, 0.85f)); // light gray
+void EditorViewportRenderer::LoadScene(const std::filesystem::path& sceneFile) {
+    // The GPU may still be reading the old scene's Mesh vertex/index buffers
+    // (up to kMaxFramesInFlight frames behind) — same "wait before touching
+    // GPU resources referenced by in-flight work" reasoning as the
+    // destructor above.
+    vkDeviceWaitIdle(m_VulkanContext->GetDevice());
+    m_Scene = ::LoadScene(*m_VulkanContext, sceneFile);
 }
 
 void EditorViewportRenderer::Resize(std::uint32_t width, std::uint32_t height) {
@@ -593,6 +561,12 @@ void EditorViewportRenderer::RenderFrame() {
     }
 
     vkResetFences(device, 1, &inFlightFence);
+
+    // Runs before the render passes below so any script-driven transform
+    // change (see ScriptComponent) is reflected in this same frame's draw,
+    // not a frame late. Uses the same deltaTime the camera was just updated
+    // with (see UpdateCamera()), not a second independently-derived value.
+    m_ScriptEngine.Update(m_Scene.GetRegistry(), m_LastDeltaTime);
 
     const VkExtent2D extent = m_Swapchain->GetExtent();
     const float time = GetElapsedSeconds();

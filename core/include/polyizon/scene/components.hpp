@@ -6,6 +6,7 @@
 #include <glm/gtc/matrix_transform.hpp>
 
 #include <memory>
+#include <string>
 
 namespace polyizon {
 
@@ -33,12 +34,27 @@ struct TransformComponent {
 // (not the case for this phase's plane+cube sample, but cheap to allow).
 struct MeshComponent {
     std::shared_ptr<Mesh> mesh;
+    // The file path mesh was imported from (see editor/src/mesh_import.hpp's
+    // LoadMesh) — kept alongside the GPU mesh itself purely so
+    // SceneSerializer (editor/src/scene_serializer.hpp) has something to
+    // write out; Mesh itself has no notion of "where it came from."
+    std::string sourcePath;
 };
 
 // Flat per-entity color for LitPipeline's shading (see lit.frag) — this
 // phase has no per-vertex color or textured materials (see mesh_vertex.hpp).
 struct MaterialComponent {
     glm::vec3 baseColor{1.0f};
+};
+
+// Optional: a Lua script file (see editor/src/script_engine.hpp) driving this
+// entity's TransformComponent each frame. Just a path — the loaded/compiled
+// Lua chunk is cached inside ScriptEngine itself, keyed by this path, not
+// stored per-entity (entities are cheap to duplicate; script state should
+// have a single lifetime tied to ScriptEngine, not to whichever entity
+// happens to reference the file).
+struct ScriptComponent {
+    std::string scriptPath;
 };
 
 } // namespace polyizon

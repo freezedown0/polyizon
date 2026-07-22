@@ -5,7 +5,9 @@
 
 #include <chrono>
 #include <cstdint>
+#include <filesystem>
 #include <memory>
+#include <optional>
 
 namespace polyizon {
 class EditorViewportRenderer;
@@ -28,6 +30,14 @@ public:
     // Swapchain::AcquireResult::NotReady's zero-extent guard on the GLFW path.
     void RenderIfExposed();
 
+    // Called from MainWindow's File > New/Open Project handlers. m_Renderer
+    // doesn't exist until this window's first exposeEvent has fired (it
+    // needs a real HWND, which only exists after QWindow::create() has run —
+    // see the header/class doc comment) — a request that arrives before
+    // that point is stashed and applied right after construction instead of
+    // being silently dropped.
+    void LoadScene(const std::filesystem::path& sceneFile);
+
 protected:
     void exposeEvent(QExposeEvent* event) override;
     void resizeEvent(QResizeEvent* event) override;
@@ -41,6 +51,9 @@ private:
     void SetMovementKeyState(int qtKey, bool pressed);
 
     std::unique_ptr<polyizon::EditorViewportRenderer> m_Renderer;
+    // Set by LoadScene() when called before m_Renderer exists; applied and
+    // cleared in exposeEvent right after construction.
+    std::optional<std::filesystem::path> m_PendingScenePath;
 
     // Held-key state for Camera::ProcessKeyboard's GLFW-agnostic overload —
     // maintained from keyPressEvent/keyReleaseEvent instead of GLFW's

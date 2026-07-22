@@ -217,3 +217,35 @@ endforeach()
 
 add_custom_target(polyizon_models DEPENDS ${POLYIZON_MODEL_OUTPUTS})
 add_dependencies(polyizon_core polyizon_models)
+
+# --- Lua script asset copying ---
+# Built-in/sample scripts live in core/scripts/ (parallel to models/shaders/
+# textures/), copied verbatim into <build>/bin/scripts — mirroring the
+# model-copy pattern above exactly. Same "asset content, not editor-specific
+# code" reasoning as models: only the editor's ScriptEngine (see
+# editor/src/script_engine.hpp) loads these this phase, but they live here
+# alongside the other asset kinds rather than under editor/.
+set(POLYIZON_SCRIPT_SOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/scripts")
+set(POLYIZON_SCRIPT_OUTPUT_DIR "${CMAKE_BINARY_DIR}/bin/scripts")
+set(POLYIZON_SCRIPT_SOURCES
+    ${POLYIZON_SCRIPT_SOURCE_DIR}/spin.lua
+)
+
+set(POLYIZON_SCRIPT_OUTPUTS "")
+foreach(script_source ${POLYIZON_SCRIPT_SOURCES})
+    get_filename_component(script_name ${script_source} NAME)
+    set(script_output "${POLYIZON_SCRIPT_OUTPUT_DIR}/${script_name}")
+
+    add_custom_command(
+        OUTPUT ${script_output}
+        COMMAND ${CMAKE_COMMAND} -E make_directory ${POLYIZON_SCRIPT_OUTPUT_DIR}
+        COMMAND ${CMAKE_COMMAND} -E copy ${script_source} ${script_output}
+        DEPENDS ${script_source}
+        COMMENT "Copying script ${script_name}"
+        VERBATIM
+    )
+    list(APPEND POLYIZON_SCRIPT_OUTPUTS ${script_output})
+endforeach()
+
+add_custom_target(polyizon_scripts DEPENDS ${POLYIZON_SCRIPT_OUTPUTS})
+add_dependencies(polyizon_core polyizon_scripts)
