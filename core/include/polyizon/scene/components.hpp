@@ -10,6 +10,14 @@
 
 namespace polyizon {
 
+// Human-readable entity identity, shown by the editor's Hierarchy panel (see
+// editor/src/hierarchy_panel.hpp) — entities have no other name/label
+// anywhere else in the engine. Every entity gets one; there's no notion of
+// an unnamed entity.
+struct TagComponent {
+    std::string name = "Entity";
+};
+
 // Entity transform: position/rotation/scale, composed into a model matrix on
 // demand rather than cached — this scene's entities (see EditorViewportRenderer)
 // are static for now, so there's no dirty-tracking/invalidation to get wrong

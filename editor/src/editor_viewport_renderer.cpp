@@ -2,6 +2,7 @@
 
 #include "scene_serializer.hpp"
 
+#include "polyizon/log.hpp"
 #include "polyizon/noise.hpp"
 
 #include <glm/gtc/matrix_transform.hpp>
@@ -566,7 +567,17 @@ void EditorViewportRenderer::RenderFrame() {
     // change (see ScriptComponent) is reflected in this same frame's draw,
     // not a frame late. Uses the same deltaTime the camera was just updated
     // with (see UpdateCamera()), not a second independently-derived value.
-    m_ScriptEngine.Update(m_Scene.GetRegistry(), m_LastDeltaTime);
+    //
+    // A Lua runtime error throws (see ScriptEngine::Update) — left uncaught
+    // it would unwind straight out of MainWindow's QTimer lambda and crash
+    // the editor. Routing it to Log instead (surfaced by the Console panel,
+    // see editor/src/console_panel.hpp) means a broken script degrades
+    // gracefully rather than taking the whole editor down with it.
+    try {
+        m_ScriptEngine.Update(m_Scene.GetRegistry(), m_LastDeltaTime);
+    } catch (const std::exception& e) {
+        Log::Error(e.what());
+    }
 
     const VkExtent2D extent = m_Swapchain->GetExtent();
     const float time = GetElapsedSeconds();

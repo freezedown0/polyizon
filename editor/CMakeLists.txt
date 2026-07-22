@@ -55,11 +55,10 @@ target_sources(polyizon_editor
         src/script_engine.cpp
         src/scene_serializer.cpp
         src/project.cpp
-
-        # Not yet implemented
-        # src/inspector.cpp
-        # src/hierarchy.cpp
-        # src/profiler.cpp
+        src/hierarchy_panel.cpp
+        src/inspector_panel.cpp
+        src/content_browser_panel.cpp
+        src/console_panel.cpp
 )
 
 # Dependencies

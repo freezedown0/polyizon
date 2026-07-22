@@ -20,6 +20,8 @@ class EditorViewportRenderer;
 // Vulkan/Qt render thread yet, single-threaded on Qt's GUI thread for this
 // phase (see the Phase 14 plan's "correctness first" note).
 class VulkanViewportWindow : public QWindow {
+    Q_OBJECT
+
 public:
     VulkanViewportWindow();
     ~VulkanViewportWindow() override;
@@ -37,6 +39,22 @@ public:
     // that point is stashed and applied right after construction instead of
     // being silently dropped.
     void LoadScene(const std::filesystem::path& sceneFile);
+
+    // Phase 17: editor panels reach the live Scene/VulkanContext through
+    // this — null until the first exposeEvent, same lifetime rule as
+    // LoadScene()'s pending-path fallback above. Panels re-fetch this every
+    // time they need it rather than caching it.
+    polyizon::EditorViewportRenderer* GetRenderer() noexcept { return m_Renderer.get(); }
+
+signals:
+    // Emitted once a scene has actually finished loading into m_Renderer —
+    // either synchronously (LoadScene() called while m_Renderer already
+    // exists) or deferred (exposeEvent() applying a pending path stashed
+    // before the renderer existed). HierarchyPanel::Refresh() must run
+    // after either case, not just the synchronous one, or a scene requested
+    // before the window's first paint (e.g. immediately after launch) would
+    // leave the Hierarchy panel silently empty.
+    void SceneLoaded();
 
 protected:
     void exposeEvent(QExposeEvent* event) override;

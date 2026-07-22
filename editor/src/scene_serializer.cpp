@@ -50,6 +50,10 @@ void SaveScene(const polyizon::Scene& scene, const std::filesystem::path& path) 
     for (const entt::entity entity : view) {
         json entityJson;
 
+        if (const auto* tag = registry.try_get<const polyizon::TagComponent>(entity)) {
+            entityJson["tag"] = tag->name;
+        }
+
         const auto& transform = view.get<const polyizon::TransformComponent>(entity);
         entityJson["transform"] = {
             { "position", Vec3ToJson(transform.position) },
@@ -98,6 +102,14 @@ polyizon::Scene LoadScene(polyizon::VulkanContext& context, const std::filesyste
 
     for (const auto& entityJson : root.at("entities")) {
         const entt::entity entity = scene.CreateEntity();
+
+        // Older (Phase 15/16) scene files predate TagComponent — default to
+        // "Entity" rather than requiring every existing scene file to be
+        // migrated.
+        const std::string tagName = entityJson.contains("tag")
+            ? entityJson.at("tag").get<std::string>()
+            : "Entity";
+        scene.GetRegistry().emplace<polyizon::TagComponent>(entity, tagName);
 
         polyizon::TransformComponent transform;
         const auto& transformJson = entityJson.at("transform");

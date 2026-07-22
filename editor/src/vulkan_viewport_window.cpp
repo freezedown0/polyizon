@@ -41,6 +41,7 @@ void VulkanViewportWindow::exposeEvent(QExposeEvent* event) {
         if (m_PendingScenePath.has_value()) {
             m_Renderer->LoadScene(*m_PendingScenePath);
             m_PendingScenePath.reset();
+            emit SceneLoaded();
         }
     }
 }
@@ -48,6 +49,7 @@ void VulkanViewportWindow::exposeEvent(QExposeEvent* event) {
 void VulkanViewportWindow::LoadScene(const std::filesystem::path& sceneFile) {
     if (m_Renderer) {
         m_Renderer->LoadScene(sceneFile);
+        emit SceneLoaded();
     } else {
         m_PendingScenePath = sceneFile;
     }

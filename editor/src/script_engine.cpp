@@ -1,5 +1,7 @@
 #include "script_engine.hpp"
 
+#include "polyizon/log.hpp"
+
 #include <glm/glm.hpp>
 
 #define WIN32_LEAN_AND_MEAN
@@ -76,15 +78,42 @@ ScriptEngine::LoadedScript& ScriptEngine::GetOrLoadScript(const std::string& scr
     // state's globals) so this script's top-level `onUpdate` can't collide
     // with a different script's — see the header's doc comment.
     sol::environment env(m_Lua, sol::create, m_Lua.globals());
-    const sol::protected_function_result loadResult = m_Lua.script_file(resolvedPath.string(), env);
-    if (!loadResult.valid()) {
-        const sol::error err = loadResult;
-        throw std::runtime_error("Failed to load script '" + resolvedPath.string() + "': " + err.what());
-    }
 
     LoadedScript loaded;
-    loaded.env = env;
-    loaded.onUpdate = env["onUpdate"];
+    {
+        // sol::script_file's default error policy (script_default_on_error,
+        // when SOL_DEFAULT_PASS_ON_ERROR isn't set) is script_throw_on_error
+        // — it THROWS a sol::error C++ exception directly from inside this
+        // call on a load failure, rather than returning an invalid result.
+        // That meant `loadResult.valid()` below was never actually reached
+        // for a missing/broken script: the throw happened first, skipped
+        // the emplace() at the bottom of this function entirely, and left
+        // the failure never cached — every frame re-attempted the load
+        // from scratch forever (spamming sol2's own stderr print each
+        // time), and reliably crashed the process after enough of that
+        // churn. sol::script_pass_on_error makes it return the invalid
+        // result instead, so the `else` branch below actually runs and the
+        // failure gets cached like any other outcome.
+        const sol::protected_function_result loadResult =
+            m_Lua.script_file(resolvedPath.string(), env, sol::script_pass_on_error);
+        if (loadResult.valid()) {
+            loaded.env = env;
+            loaded.onUpdate = env["onUpdate"];
+        } else {
+            // Deliberately NOT thrown: a missing/broken script file must
+            // only ever be attempted once. Throwing here meant every entity
+            // referencing it re-parsed from scratch every single frame
+            // forever — besides being wasteful, this leaked a fresh
+            // sol::environment/Lua registry entry per attempt with nothing
+            // ever freeing the old ones, and reliably crashed the whole
+            // process after a minute or two of 60Hz retries. Caching an
+            // entry with an invalid onUpdate (Update()'s existing
+            // `!script.onUpdate.valid()` check already skips those) makes a
+            // broken script a one-time cost instead.
+            const sol::error err = loadResult;
+            polyizon::Log::Error("Failed to load script '" + resolvedPath.string() + "': " + err.what());
+        }
+    }
 
     const auto [inserted, wasInserted] = m_LoadedScripts.emplace(scriptPath, std::move(loaded));
     return inserted->second;

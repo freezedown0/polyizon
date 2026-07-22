@@ -30,6 +30,7 @@
 
 #include <GLFW/glfw3.h>
 
+#include "polyizon/log.hpp"
 #include "polyizon/window.hpp"
 
 #include <algorithm>
@@ -54,6 +55,11 @@ VKAPI_ATTR VkBool32 VKAPI_CALL DebugMessengerCallback(
     void* /*userData*/) {
     if (severity >= VK_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT) {
         std::fprintf(stderr, "[Vulkan] %s\n", callbackData->pMessage);
+        if (severity >= VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT) {
+            Log::Error(std::string("[Vulkan] ") + callbackData->pMessage);
+        } else {
+            Log::Warning(std::string("[Vulkan] ") + callbackData->pMessage);
+        }
     }
     return VK_FALSE;
 }

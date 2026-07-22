@@ -89,6 +89,15 @@ public:
     // in flight) before replacing m_Scene outright — see scene_serializer.hpp.
     void LoadScene(const std::filesystem::path& sceneFile);
 
+    // Phase 17: editor panels (Hierarchy/Inspector/ContentBrowser, see
+    // editor/src/*_panel.hpp) read and mutate the live scene directly through
+    // these — no separate "editor scene" copy. Callers that destroy a Mesh's
+    // GPU buffers (deleting an entity, replacing a MeshComponent) must
+    // vkDeviceWaitIdle(GetVulkanContext().GetDevice()) first, same as
+    // LoadScene() does internally.
+    Scene& GetScene() noexcept { return m_Scene; }
+    VulkanContext& GetVulkanContext() noexcept { return *m_VulkanContext; }
+
 private:
     void CreateFrameSyncObjects();
     void DestroyFrameSyncObjects();
