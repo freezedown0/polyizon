@@ -16,6 +16,12 @@ find_package(Qt6 CONFIG REQUIRED COMPONENTS Widgets)
 # resolved IMPORTED_LOCATION_DEBUG/RELEASE path below — never linked.
 find_package(Qt6QWindowsIntegrationPlugin CONFIG REQUIRED PATHS "${Qt6Gui_DIR}")
 
+# Assimp is this target's own dependency too, not core/game's — same
+# reasoning/scoping as Qt6 above (see mesh_import.hpp): only editor/
+# imports .obj/.fbx files, so the GLFW-only game client's configure never
+# needs Assimp installed either.
+find_package(assimp CONFIG REQUIRED)
+
 add_executable(polyizon_editor)
 
 # Required for QObject-derived classes (MainWindow's Q_OBJECT) to have their
@@ -35,6 +41,7 @@ target_sources(polyizon_editor
         src/main_window.cpp
         src/vulkan_viewport_window.cpp
         src/editor_viewport_renderer.cpp
+        src/mesh_import.cpp
 
         # Not yet implemented
         # src/inspector.cpp
@@ -48,6 +55,7 @@ target_link_libraries(polyizon_editor
         polyizon_core
         Qt6::Widgets
         Vulkan::Vulkan
+        assimp::assimp
 )
 
 # C++ standard

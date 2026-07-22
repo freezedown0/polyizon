@@ -1,45 +1,35 @@
 #include "editor_viewport_renderer.hpp"
 
+#include "mesh_import.hpp"
+
 #include "polyizon/noise.hpp"
-#include "polyizon/vulkan/vertex.hpp"
 
 #include <glm/gtc/matrix_transform.hpp>
 
+#define WIN32_LEAN_AND_MEAN
+#include <Windows.h>
+
 #include <array>
 #include <cmath>
-#include <cstddef>
+#include <cstring>
+#include <filesystem>
 #include <stdexcept>
 
 namespace polyizon {
 
 namespace {
 
-// Identical hardcoded demo scene to Application's (application.cpp) — this
-// phase renders the same content on both paths, no editor-specific scene
-// authoring exists yet.
-const std::array<Vertex, 4> kQuadVertices = {
-    Vertex{ {-0.5f, -0.5f}, {1.0f, 0.0f, 0.0f}, {0.0f, 0.0f} },
-    Vertex{ { 0.5f, -0.5f}, {0.0f, 1.0f, 0.0f}, {1.0f, 0.0f} },
-    Vertex{ { 0.5f,  0.5f}, {0.0f, 0.0f, 1.0f}, {1.0f, 1.0f} },
-    Vertex{ {-0.5f,  0.5f}, {1.0f, 1.0f, 0.0f}, {0.0f, 1.0f} },
-};
-const std::array<std::uint16_t, 6> kQuadIndices = { 0, 1, 2, 2, 3, 0 };
-
-constexpr std::size_t kInstanceCount = 5;
-
-const std::array<glm::vec3, kInstanceCount> kInstancePositions = {
-    glm::vec3(-0.9f, 0.0f,  0.6f),
-    glm::vec3(-0.45f, 0.0f, 0.3f),
-    glm::vec3( 0.0f, 0.0f,  0.0f),
-    glm::vec3( 0.45f, 0.0f, -0.3f),
-    glm::vec3( 0.9f, 0.0f, -0.6f),
-};
-
-glm::mat4 ComputeInstanceModel(std::size_t index, float time) {
-    const float phase = static_cast<float>(index) * glm::radians(72.0f);
-    const glm::mat4 rotation = glm::rotate(
-        glm::mat4(1.0f), time * glm::radians(90.0f) + phase, glm::vec3(0.0f, 0.0f, 1.0f));
-    return glm::translate(glm::mat4(1.0f), kInstancePositions[index]) * rotation;
+// Resolved relative to the running executable's own directory, matching
+// every other class's identical private helper (Image, GraphicsPipeline,
+// etc.) — duplicated here rather than shared for the same reason they
+// duplicate it from each other.
+std::filesystem::path GetExecutableDirectory() {
+    wchar_t buffer[MAX_PATH];
+    const DWORD length = GetModuleFileNameW(nullptr, buffer, MAX_PATH);
+    if (length == 0 || length == MAX_PATH) {
+        throw std::runtime_error("Failed to resolve executable directory");
+    }
+    return std::filesystem::path(buffer).parent_path();
 }
 
 } // namespace
@@ -47,30 +37,24 @@ glm::mat4 ComputeInstanceModel(std::size_t index, float time) {
 EditorViewportRenderer::EditorViewportRenderer(HWND hwnd, HINSTANCE hinstance, std::uint32_t width, std::uint32_t height) {
     m_VulkanContext = std::make_unique<VulkanContext>(hwnd, hinstance, "Polyizon Editor");
     m_Swapchain = std::make_unique<Swapchain>(*m_VulkanContext, width, height);
-    m_Pipeline = std::make_unique<GraphicsPipeline>(
-        m_VulkanContext->GetDevice(), m_Swapchain->GetImageFormat(), m_Swapchain->GetDepthFormat());
     m_SkyPipeline = std::make_unique<SkyPipeline>(
         m_VulkanContext->GetDevice(), m_Swapchain->GetImageFormat(), m_Swapchain->GetDepthFormat());
-
-    m_Texture = Image::CreateFromFile(*m_VulkanContext, "checkerboard.png"); // must precede CreateDescriptorResources()
+    m_LitPipeline = std::make_unique<LitPipeline>(
+        m_VulkanContext->GetDevice(), m_Swapchain->GetImageFormat(), m_Swapchain->GetDepthFormat());
+    m_ShadowPipeline = std::make_unique<ShadowPipeline>(m_VulkanContext->GetDevice(), m_Swapchain->GetDepthFormat());
 
     const CloudNoiseParams cloudNoiseParams{}; // same defaults as Application; not yet developer-editable here either
     const std::vector<std::uint8_t> cloudNoiseData = LoadOrGenerateCloudNoiseVolume(cloudNoiseParams);
     m_CloudNoiseTexture = std::make_unique<Texture3D>(*m_VulkanContext, cloudNoiseData.data(),
         cloudNoiseParams.resolution, cloudNoiseParams.resolution, cloudNoiseParams.resolution);
 
+    // Reuses the swapchain's already-queried supported depth format (see
+    // ShadowMap's constructor comment) rather than re-deriving it.
+    m_ShadowMap = std::make_unique<ShadowMap>(*m_VulkanContext, m_Swapchain->GetDepthFormat(), kShadowMapResolution);
+
+    BuildSampleScene(); // must precede CreateDescriptorResources(): none of it touches descriptors, but keeps mesh/scene setup grouped before GPU descriptor wiring
+
     CreateDescriptorResources();
-
-    m_VertexBuffer = Buffer::CreateDeviceLocal(*m_VulkanContext, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
-        kQuadVertices.data(), sizeof(Vertex) * kQuadVertices.size());
-    m_IndexBuffer = Buffer::CreateDeviceLocal(*m_VulkanContext, VK_BUFFER_USAGE_INDEX_BUFFER_BIT,
-        kQuadIndices.data(), sizeof(std::uint16_t) * kQuadIndices.size());
-
-    for (std::uint32_t i = 0; i < kMaxFramesInFlight; ++i) {
-        m_InstanceBuffers[i] = std::make_unique<Buffer>(
-            m_VulkanContext->GetAllocator(), sizeof(glm::mat4) * kInstanceCount, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT);
-    }
-
     CreateFrameSyncObjects();
 }
 
@@ -84,12 +68,74 @@ EditorViewportRenderer::~EditorViewportRenderer() {
     DestroyDescriptorResources();
 }
 
+void EditorViewportRenderer::BuildSampleScene() {
+    const std::filesystem::path modelsDir = GetExecutableDirectory() / "models";
+    m_PlaneMesh = LoadMesh(*m_VulkanContext, modelsDir / "plane.obj");
+    m_CubeMesh = LoadMesh(*m_VulkanContext, modelsDir / "cube.obj");
+
+    // Ground plane at the origin — plane.obj is already a flat 10x10 quad in
+    // the XZ plane (see core/models/plane.obj), no transform needed beyond
+    // the identity default.
+    const entt::entity planeEntity = m_Scene.CreateEntity();
+    m_Scene.GetRegistry().emplace<TransformComponent>(planeEntity);
+    m_Scene.GetRegistry().emplace<MeshComponent>(planeEntity, m_PlaneMesh);
+    m_Scene.GetRegistry().emplace<MaterialComponent>(planeEntity, glm::vec3(0.3f, 0.6f, 0.25f)); // grass-ish green
+
+    // Cube resting on the plane: cube.obj is a unit cube centered at its own
+    // local origin (spans -0.5..0.5), so position.y=0.5 puts its bottom face
+    // exactly at the plane's y=0 — the actual shadow-mapping test case.
+    const entt::entity cubeEntity = m_Scene.CreateEntity();
+    TransformComponent cubeTransform;
+    cubeTransform.position = glm::vec3(0.0f, 0.5f, 0.0f);
+    m_Scene.GetRegistry().emplace<TransformComponent>(cubeEntity, cubeTransform);
+    m_Scene.GetRegistry().emplace<MeshComponent>(cubeEntity, m_CubeMesh);
+    m_Scene.GetRegistry().emplace<MaterialComponent>(cubeEntity, glm::vec3(0.8f, 0.8f, 0.85f)); // light gray
+}
+
 void EditorViewportRenderer::Resize(std::uint32_t width, std::uint32_t height) {
     m_Swapchain->Resize(width, height);
 }
 
 float EditorViewportRenderer::GetElapsedSeconds() const {
     return std::chrono::duration<float>(std::chrono::steady_clock::now() - m_ClockStart).count();
+}
+
+glm::vec3 EditorViewportRenderer::GetSunDirection() const {
+    const float elevation = glm::radians(m_SunElevationDegrees);
+    const float azimuth = glm::radians(m_SunAzimuthDegrees);
+    return glm::normalize(glm::vec3(
+        std::cos(elevation) * std::cos(azimuth),
+        std::sin(elevation),
+        std::cos(elevation) * std::sin(azimuth)));
+}
+
+glm::mat4 EditorViewportRenderer::GetLightSpaceMatrix() const {
+    const glm::vec3 sunDir = GetSunDirection();
+    // Roughly the vertical midpoint between the plane (y=0) and the cube's
+    // top (y=1) — comfortably centers both in the light's frustum.
+    const glm::vec3 sceneCenter(0.0f, 0.5f, 0.0f);
+    constexpr float kLightDistance = 15.0f;
+    constexpr float kOrthoHalfExtent = 8.0f; // plane spans -5..5; this gives margin
+    constexpr float kNear = 0.1f;
+    constexpr float kFar = kLightDistance * 2.0f;
+
+    // Guards the near-vertical-sun degenerate case (view direction parallel
+    // to the default up vector, which would make lookAt's cross product
+    // collapse) — not reachable with this phase's fixed 25-degree elevation
+    // default, but cheap to guard now rather than leave a latent NaN trap for
+    // whenever a future phase makes this developer-editable.
+    const glm::vec3 up = (std::abs(sunDir.y) > 0.99f) ? glm::vec3(0.0f, 0.0f, 1.0f) : glm::vec3(0.0f, 1.0f, 0.0f);
+
+    const glm::mat4 lightView = glm::lookAt(sceneCenter + sunDir * kLightDistance, sceneCenter, up);
+    glm::mat4 lightProj = glm::ortho(-kOrthoHalfExtent, kOrthoHalfExtent, -kOrthoHalfExtent, kOrthoHalfExtent, kNear, kFar);
+    // Same Y-flip convention as every camera projection in this codebase
+    // (Vulkan NDC is Y-down; glm::perspective/ortho assume Y-up) — keeps this
+    // matrix's NDC-to-image-space handedness consistent with how
+    // vkCmdSetViewport/the rasterizer actually place data into ShadowMap, so
+    // lit.frag's plain `ndc.xy * 0.5 + 0.5` UV reconstruction is correct.
+    lightProj[1][1] *= -1.0f;
+
+    return lightProj * lightView;
 }
 
 void EditorViewportRenderer::CreateFrameSyncObjects() {
@@ -156,12 +202,17 @@ void EditorViewportRenderer::CreateDescriptorResources() {
     VkDevice device = m_VulkanContext->GetDevice();
 
     for (std::uint32_t i = 0; i < kMaxFramesInFlight; ++i) {
-        m_UniformBuffers[i] = std::make_unique<Buffer>(
-            m_VulkanContext->GetAllocator(), sizeof(UniformBufferObject), VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT);
+        m_LitUniformBuffers[i] = std::make_unique<Buffer>(
+            m_VulkanContext->GetAllocator(), sizeof(LitUniformBufferObject), VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT);
         m_SkyUniformBuffers[i] = std::make_unique<Buffer>(
             m_VulkanContext->GetAllocator(), sizeof(SkyUniformBufferObject), VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT);
     }
 
+    // poolSizes[0] (UBO) covers both the lit pipeline's per-frame UBO and the
+    // sky pipeline's per-frame UBO — kMaxFramesInFlight * 2 total sets come
+    // out of this one pool (lit set + sky set per frame-in-flight).
+    // poolSizes[1] (combined image sampler) similarly covers both the lit
+    // pipeline's shadow map and the sky pipeline's cloud noise volume.
     std::array<VkDescriptorPoolSize, 2> poolSizes{};
     poolSizes[0].type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
     poolSizes[0].descriptorCount = kMaxFramesInFlight * 2;
@@ -178,17 +229,17 @@ void EditorViewportRenderer::CreateDescriptorResources() {
         throw std::runtime_error("Failed to create Vulkan descriptor pool");
     }
 
-    std::array<VkDescriptorSetLayout, kMaxFramesInFlight> layouts{};
-    layouts.fill(m_Pipeline->GetDescriptorSetLayout());
+    std::array<VkDescriptorSetLayout, kMaxFramesInFlight> litLayouts{};
+    litLayouts.fill(m_LitPipeline->GetDescriptorSetLayout());
 
-    VkDescriptorSetAllocateInfo allocInfo{};
-    allocInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
-    allocInfo.descriptorPool = m_DescriptorPool;
-    allocInfo.descriptorSetCount = kMaxFramesInFlight;
-    allocInfo.pSetLayouts = layouts.data();
+    VkDescriptorSetAllocateInfo litAllocInfo{};
+    litAllocInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+    litAllocInfo.descriptorPool = m_DescriptorPool;
+    litAllocInfo.descriptorSetCount = kMaxFramesInFlight;
+    litAllocInfo.pSetLayouts = litLayouts.data();
 
-    if (vkAllocateDescriptorSets(device, &allocInfo, m_DescriptorSets.data()) != VK_SUCCESS) {
-        throw std::runtime_error("Failed to allocate Vulkan descriptor sets");
+    if (vkAllocateDescriptorSets(device, &litAllocInfo, m_LitDescriptorSets.data()) != VK_SUCCESS) {
+        throw std::runtime_error("Failed to allocate Vulkan lit descriptor sets");
     }
 
     std::array<VkDescriptorSetLayout, kMaxFramesInFlight> skyLayouts{};
@@ -205,32 +256,32 @@ void EditorViewportRenderer::CreateDescriptorResources() {
     }
 
     for (std::uint32_t i = 0; i < kMaxFramesInFlight; ++i) {
-        VkDescriptorBufferInfo bufferInfo{};
-        bufferInfo.buffer = m_UniformBuffers[i]->GetBuffer();
-        bufferInfo.offset = 0;
-        bufferInfo.range = sizeof(UniformBufferObject);
+        VkDescriptorBufferInfo litBufferInfo{};
+        litBufferInfo.buffer = m_LitUniformBuffers[i]->GetBuffer();
+        litBufferInfo.offset = 0;
+        litBufferInfo.range = sizeof(LitUniformBufferObject);
 
-        VkDescriptorImageInfo imageInfo{};
-        imageInfo.sampler = m_Texture->GetSampler();
-        imageInfo.imageView = m_Texture->GetImageView();
-        imageInfo.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        VkDescriptorImageInfo shadowMapInfo{};
+        shadowMapInfo.sampler = m_ShadowMap->GetSampler();
+        shadowMapInfo.imageView = m_ShadowMap->GetImageView();
+        shadowMapInfo.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
 
-        std::array<VkWriteDescriptorSet, 2> writes{};
-        writes[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-        writes[0].dstSet = m_DescriptorSets[i];
-        writes[0].dstBinding = 0;
-        writes[0].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
-        writes[0].descriptorCount = 1;
-        writes[0].pBufferInfo = &bufferInfo;
+        std::array<VkWriteDescriptorSet, 2> litWrites{};
+        litWrites[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        litWrites[0].dstSet = m_LitDescriptorSets[i];
+        litWrites[0].dstBinding = 0;
+        litWrites[0].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+        litWrites[0].descriptorCount = 1;
+        litWrites[0].pBufferInfo = &litBufferInfo;
 
-        writes[1].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-        writes[1].dstSet = m_DescriptorSets[i];
-        writes[1].dstBinding = 1;
-        writes[1].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-        writes[1].descriptorCount = 1;
-        writes[1].pImageInfo = &imageInfo;
+        litWrites[1].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        litWrites[1].dstSet = m_LitDescriptorSets[i];
+        litWrites[1].dstBinding = 1;
+        litWrites[1].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        litWrites[1].descriptorCount = 1;
+        litWrites[1].pImageInfo = &shadowMapInfo;
 
-        vkUpdateDescriptorSets(device, static_cast<std::uint32_t>(writes.size()), writes.data(), 0, nullptr);
+        vkUpdateDescriptorSets(device, static_cast<std::uint32_t>(litWrites.size()), litWrites.data(), 0, nullptr);
 
         VkDescriptorBufferInfo skyBufferInfo{};
         skyBufferInfo.buffer = m_SkyUniformBuffers[i]->GetBuffer();
@@ -271,25 +322,18 @@ void EditorViewportRenderer::DestroyDescriptorResources() {
     }
 }
 
-void EditorViewportRenderer::UpdateUniformBuffer(std::uint32_t frameIndex, VkExtent2D extent) {
-    UniformBufferObject ubo{};
+void EditorViewportRenderer::UpdateLitUniformBuffer(std::uint32_t frameIndex, VkExtent2D extent) {
+    LitUniformBufferObject ubo{};
     ubo.view = m_Camera.GetViewMatrix();
 
     const float aspect = static_cast<float>(extent.width) / static_cast<float>(extent.height);
-    ubo.proj = glm::perspective(glm::radians(45.0f), aspect, 0.1f, 10.0f);
+    ubo.proj = glm::perspective(glm::radians(45.0f), aspect, 0.1f, 50.0f);
     ubo.proj[1][1] *= -1.0f;
 
-    ubo.fogColorAndDensity = glm::vec4(0.75f, 0.8f, 0.85f, m_FogDensity);
+    ubo.lightSpaceMatrix = GetLightSpaceMatrix();
+    ubo.sunDirectionAndAmbient = glm::vec4(GetSunDirection(), m_AmbientStrength);
 
-    m_UniformBuffers[frameIndex]->Upload(&ubo, sizeof(ubo));
-}
-
-void EditorViewportRenderer::UpdateInstanceBuffer(std::uint32_t frameIndex, float time) {
-    std::array<glm::mat4, kInstanceCount> models{};
-    for (std::size_t i = 0; i < kInstanceCount; ++i) {
-        models[i] = ComputeInstanceModel(i, time);
-    }
-    m_InstanceBuffers[frameIndex]->Upload(models.data(), sizeof(glm::mat4) * kInstanceCount);
+    m_LitUniformBuffers[frameIndex]->Upload(&ubo, sizeof(ubo));
 }
 
 void EditorViewportRenderer::UpdateSkyUniformBuffer(std::uint32_t frameIndex, VkExtent2D extent, float time) {
@@ -297,16 +341,11 @@ void EditorViewportRenderer::UpdateSkyUniformBuffer(std::uint32_t frameIndex, Vk
     sky.invView = glm::inverse(m_Camera.GetViewMatrix());
 
     const float aspect = static_cast<float>(extent.width) / static_cast<float>(extent.height);
-    glm::mat4 proj = glm::perspective(glm::radians(45.0f), aspect, 0.1f, 10.0f);
+    glm::mat4 proj = glm::perspective(glm::radians(45.0f), aspect, 0.1f, 50.0f);
     proj[1][1] *= -1.0f;
     sky.invProj = glm::inverse(proj);
 
-    const float elevation = glm::radians(m_SunElevationDegrees);
-    const float azimuth = glm::radians(m_SunAzimuthDegrees);
-    sky.sunDirection = glm::vec4(glm::normalize(glm::vec3(
-        std::cos(elevation) * std::cos(azimuth),
-        std::sin(elevation),
-        std::cos(elevation) * std::sin(azimuth))), 0.0f);
+    sky.sunDirection = glm::vec4(GetSunDirection(), 0.0f);
 
     sky.timeAndSun = glm::vec4(time, glm::radians(1.5f), 0.0f, 0.0f);
     sky.atmosphereParams0 = glm::vec4(6360.0f, 60.0f, 0.5f, 8.0f);
@@ -321,37 +360,101 @@ void EditorViewportRenderer::UpdateSkyUniformBuffer(std::uint32_t frameIndex, Vk
     m_SkyUniformBuffers[frameIndex]->Upload(&sky, sizeof(sky));
 }
 
-void EditorViewportRenderer::RenderFrame() {
-    VkDevice device = m_VulkanContext->GetDevice();
-    VkFence inFlightFence = m_InFlightFences[m_CurrentFrame];
+void EditorViewportRenderer::RenderShadowPass(VkCommandBuffer cmd) {
+    const VkImageSubresourceRange depthRange{ VK_IMAGE_ASPECT_DEPTH_BIT, 0, 1, 0, 1 };
 
-    vkWaitForFences(device, 1, &inFlightFence, VK_TRUE, UINT64_MAX);
+    VkImageMemoryBarrier2 toDepthAttachment{};
+    toDepthAttachment.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
+    // First frame: the shadow map's initial layout is UNDEFINED (see
+    // ShadowMap::CreateImage()), transitioned from TOP_OF_PIPE/NONE. Every
+    // subsequent frame: it's coming from the previous frame's shader-read
+    // (see the barrier after vkCmdEndRendering below), so the source stage/
+    // access must match what actually last touched it.
+    toDepthAttachment.srcStageMask =
+        m_FirstFrame ? VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT : VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT;
+    toDepthAttachment.srcAccessMask = m_FirstFrame ? VK_ACCESS_2_NONE : VK_ACCESS_2_SHADER_READ_BIT;
+    toDepthAttachment.dstStageMask =
+        VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT;
+    toDepthAttachment.dstAccessMask = VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+    toDepthAttachment.oldLayout = m_FirstFrame ? VK_IMAGE_LAYOUT_UNDEFINED : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    toDepthAttachment.newLayout = VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL;
+    toDepthAttachment.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    toDepthAttachment.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    toDepthAttachment.image = m_ShadowMap->GetImage();
+    toDepthAttachment.subresourceRange = depthRange;
 
-    std::uint32_t imageIndex = 0;
-    const Swapchain::AcquireResult acquireResult =
-        m_Swapchain->AcquireNextImage(m_ImageAvailableSemaphores[m_CurrentFrame], imageIndex);
-    if (acquireResult != Swapchain::AcquireResult::Success) {
-        return;
+    VkDependencyInfo toDepthDep{};
+    toDepthDep.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
+    toDepthDep.imageMemoryBarrierCount = 1;
+    toDepthDep.pImageMemoryBarriers = &toDepthAttachment;
+    vkCmdPipelineBarrier2(cmd, &toDepthDep);
+
+    VkRenderingAttachmentInfo depthAttachment{};
+    depthAttachment.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
+    depthAttachment.imageView = m_ShadowMap->GetImageView();
+    depthAttachment.imageLayout = VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL;
+    depthAttachment.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+    depthAttachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE; // read back by the lit pass this same frame
+    depthAttachment.clearValue.depthStencil = { 1.0f, 0 };
+
+    const std::uint32_t resolution = m_ShadowMap->GetResolution();
+
+    VkRenderingInfo renderingInfo{};
+    renderingInfo.sType = VK_STRUCTURE_TYPE_RENDERING_INFO;
+    renderingInfo.renderArea = { { 0, 0 }, { resolution, resolution } };
+    renderingInfo.layerCount = 1;
+    renderingInfo.pDepthAttachment = &depthAttachment;
+
+    vkCmdBeginRendering(cmd, &renderingInfo);
+
+    VkViewport viewport{};
+    viewport.width = static_cast<float>(resolution);
+    viewport.height = static_cast<float>(resolution);
+    viewport.minDepth = 0.0f;
+    viewport.maxDepth = 1.0f;
+    vkCmdSetViewport(cmd, 0, 1, &viewport);
+
+    VkRect2D scissor{ { 0, 0 }, { resolution, resolution } };
+    vkCmdSetScissor(cmd, 0, 1, &scissor);
+
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_ShadowPipeline->GetPipeline());
+
+    const glm::mat4 lightSpaceMatrix = GetLightSpaceMatrix();
+    auto view = m_Scene.GetRegistry().view<TransformComponent, MeshComponent>();
+    for (auto entity : view) {
+        const auto& [transform, meshComponent] = view.get<TransformComponent, MeshComponent>(entity);
+        const glm::mat4 lightSpaceMVP = lightSpaceMatrix * transform.GetMatrix();
+        vkCmdPushConstants(cmd, m_ShadowPipeline->GetLayout(), VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof(glm::mat4), &lightSpaceMVP);
+
+        const VkBuffer vertexBuffer = meshComponent.mesh->GetVertexBuffer();
+        const VkDeviceSize offset = 0;
+        vkCmdBindVertexBuffers(cmd, 0, 1, &vertexBuffer, &offset);
+        vkCmdBindIndexBuffer(cmd, meshComponent.mesh->GetIndexBuffer(), 0, VK_INDEX_TYPE_UINT32);
+        vkCmdDrawIndexed(cmd, meshComponent.mesh->GetIndexCount(), 1, 0, 0, 0);
     }
 
-    vkResetFences(device, 1, &inFlightFence);
+    vkCmdEndRendering(cmd);
 
-    const VkExtent2D extent = m_Swapchain->GetExtent();
-    const float time = GetElapsedSeconds();
-    UpdateUniformBuffer(m_CurrentFrame, extent);
-    UpdateInstanceBuffer(m_CurrentFrame, time);
-    UpdateSkyUniformBuffer(m_CurrentFrame, extent, time);
+    VkImageMemoryBarrier2 toShaderRead = toDepthAttachment;
+    toShaderRead.srcStageMask =
+        VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT;
+    toShaderRead.srcAccessMask = VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+    toShaderRead.dstStageMask = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT;
+    toShaderRead.dstAccessMask = VK_ACCESS_2_SHADER_READ_BIT;
+    toShaderRead.oldLayout = VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL;
+    toShaderRead.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
 
-    VkCommandBuffer cmd = m_CommandBuffers[m_CurrentFrame];
-    vkResetCommandBuffer(cmd, 0);
+    VkDependencyInfo toShaderReadDep{};
+    toShaderReadDep.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
+    toShaderReadDep.imageMemoryBarrierCount = 1;
+    toShaderReadDep.pImageMemoryBarriers = &toShaderRead;
+    vkCmdPipelineBarrier2(cmd, &toShaderReadDep);
 
-    VkCommandBufferBeginInfo beginInfo{};
-    beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
-    beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-    vkBeginCommandBuffer(cmd, &beginInfo);
+    m_FirstFrame = false;
+}
 
-    VkImage image = m_Swapchain->GetImage(imageIndex);
-    const VkImageSubresourceRange range{ VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+void EditorViewportRenderer::RenderMainPass(VkCommandBuffer cmd, VkImage colorImage, std::uint32_t imageIndex, VkExtent2D extent) {
+    const VkImageSubresourceRange colorRange{ VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
 
     VkImageMemoryBarrier2 toColorAttachment{};
     toColorAttachment.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
@@ -363,8 +466,8 @@ void EditorViewportRenderer::RenderFrame() {
     toColorAttachment.newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
     toColorAttachment.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
     toColorAttachment.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    toColorAttachment.image = image;
-    toColorAttachment.subresourceRange = range;
+    toColorAttachment.image = colorImage;
+    toColorAttachment.subresourceRange = colorRange;
 
     const VkImageSubresourceRange depthRange{ VK_IMAGE_ASPECT_DEPTH_BIT, 0, 1, 0, 1 };
 
@@ -424,26 +527,41 @@ void EditorViewportRenderer::RenderFrame() {
     VkRect2D scissor{ { 0, 0 }, extent };
     vkCmdSetScissor(cmd, 0, 1, &scissor);
 
+    // Sky pass first (background), same as before this phase.
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_SkyPipeline->GetPipeline());
     vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_SkyPipeline->GetLayout(), 0, 1,
         &m_SkyDescriptorSets[m_CurrentFrame], 0, nullptr);
     vkCmdDraw(cmd, 3, 1, 0, 0);
 
-    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_Pipeline->GetPipeline());
+    // Lit scene pass: each entity is a separate draw with its own push-
+    // constant model matrix/color (see LitPipeline) rather than an instanced
+    // draw — this scene has a handful of distinct meshes, not many identical
+    // instances.
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_LitPipeline->GetPipeline());
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_LitPipeline->GetLayout(), 0, 1,
+        &m_LitDescriptorSets[m_CurrentFrame], 0, nullptr);
 
-    const VkBuffer vertexBuffers[] = { m_VertexBuffer->GetBuffer(), m_InstanceBuffers[m_CurrentFrame]->GetBuffer() };
-    const VkDeviceSize offsets[] = { 0, 0 };
-    vkCmdBindVertexBuffers(cmd, 0, 2, vertexBuffers, offsets);
-    vkCmdBindIndexBuffer(cmd, m_IndexBuffer->GetBuffer(), 0, VK_INDEX_TYPE_UINT16);
+    auto view = m_Scene.GetRegistry().view<TransformComponent, MeshComponent, MaterialComponent>();
+    for (auto entity : view) {
+        const auto& [transform, meshComponent, material] = view.get<TransformComponent, MeshComponent, MaterialComponent>(entity);
 
-    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_Pipeline->GetLayout(), 0, 1,
-        &m_DescriptorSets[m_CurrentFrame], 0, nullptr);
+        LitPushConstants pc{};
+        const glm::mat4 model = transform.GetMatrix();
+        std::memcpy(pc.model, &model, sizeof(pc.model));
+        pc.baseColor[0] = material.baseColor.r;
+        pc.baseColor[1] = material.baseColor.g;
+        pc.baseColor[2] = material.baseColor.b;
+        pc.baseColor[3] = 1.0f;
+        vkCmdPushConstants(cmd, m_LitPipeline->GetLayout(),
+            VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(pc), &pc);
 
-    vkCmdDrawIndexed(cmd, 6, static_cast<std::uint32_t>(kInstanceCount), 0, 0, 0);
+        const VkBuffer vertexBuffer = meshComponent.mesh->GetVertexBuffer();
+        const VkDeviceSize offset = 0;
+        vkCmdBindVertexBuffers(cmd, 0, 1, &vertexBuffer, &offset);
+        vkCmdBindIndexBuffer(cmd, meshComponent.mesh->GetIndexBuffer(), 0, VK_INDEX_TYPE_UINT32);
+        vkCmdDrawIndexed(cmd, meshComponent.mesh->GetIndexCount(), 1, 0, 0, 0);
+    }
 
-    // No ImGui overlay on this path yet (see class doc comment) — this
-    // rendering scope just ends here instead of also drawing debug-overlay
-    // draw data like Application::RenderFrame() does.
     vkCmdEndRendering(cmd);
 
     VkImageMemoryBarrier2 toPresent = toColorAttachment;
@@ -459,6 +577,38 @@ void EditorViewportRenderer::RenderFrame() {
     toPresentDep.imageMemoryBarrierCount = 1;
     toPresentDep.pImageMemoryBarriers = &toPresent;
     vkCmdPipelineBarrier2(cmd, &toPresentDep);
+}
+
+void EditorViewportRenderer::RenderFrame() {
+    VkDevice device = m_VulkanContext->GetDevice();
+    VkFence inFlightFence = m_InFlightFences[m_CurrentFrame];
+
+    vkWaitForFences(device, 1, &inFlightFence, VK_TRUE, UINT64_MAX);
+
+    std::uint32_t imageIndex = 0;
+    const Swapchain::AcquireResult acquireResult =
+        m_Swapchain->AcquireNextImage(m_ImageAvailableSemaphores[m_CurrentFrame], imageIndex);
+    if (acquireResult != Swapchain::AcquireResult::Success) {
+        return;
+    }
+
+    vkResetFences(device, 1, &inFlightFence);
+
+    const VkExtent2D extent = m_Swapchain->GetExtent();
+    const float time = GetElapsedSeconds();
+    UpdateLitUniformBuffer(m_CurrentFrame, extent);
+    UpdateSkyUniformBuffer(m_CurrentFrame, extent, time);
+
+    VkCommandBuffer cmd = m_CommandBuffers[m_CurrentFrame];
+    vkResetCommandBuffer(cmd, 0);
+
+    VkCommandBufferBeginInfo beginInfo{};
+    beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+    beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    vkBeginCommandBuffer(cmd, &beginInfo);
+
+    RenderShadowPass(cmd);
+    RenderMainPass(cmd, m_Swapchain->GetImage(imageIndex), imageIndex, extent);
 
     vkEndCommandBuffer(cmd);
 

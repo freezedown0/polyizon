@@ -28,9 +28,13 @@ target_sources(polyizon_core
         src/vulkan/swapchain.cpp
         src/vulkan/pipeline.cpp
         src/vulkan/sky_pipeline.cpp
+        src/vulkan/lit_pipeline.cpp
+        src/vulkan/shadow_pipeline.cpp
         src/vulkan/buffer.cpp
         src/vulkan/image.cpp
         src/vulkan/texture3d.cpp
+        src/vulkan/mesh.cpp
+        src/vulkan/shadow_map.cpp
 
         # Vendored imgui_impl_vulkan.cpp (see third_party/imgui_impl_vulkan/):
         # vcpkg's imgui port is installed WITHOUT its vulkan-binding feature
@@ -127,6 +131,9 @@ set(POLYIZON_SHADER_SOURCES
     ${POLYIZON_SHADER_SOURCE_DIR}/triangle.frag
     ${POLYIZON_SHADER_SOURCE_DIR}/sky.vert
     ${POLYIZON_SHADER_SOURCE_DIR}/sky.frag
+    ${POLYIZON_SHADER_SOURCE_DIR}/lit.vert
+    ${POLYIZON_SHADER_SOURCE_DIR}/lit.frag
+    ${POLYIZON_SHADER_SOURCE_DIR}/shadow.vert
 )
 
 set(POLYIZON_SHADER_OUTPUTS "")
@@ -177,3 +184,36 @@ endforeach()
 
 add_custom_target(polyizon_textures DEPENDS ${POLYIZON_TEXTURE_OUTPUTS})
 add_dependencies(polyizon_core polyizon_textures)
+
+# --- 3D model asset copying ---
+# Models live in core/models/ (parallel to shaders/textures/). Copied
+# verbatim into <build>/bin/models — same directory both executables run
+# from — mirroring the texture-copy pattern above exactly. Only the editor
+# target loads these this phase (see editor/src/mesh_import.hpp), but models
+# are asset content like shaders/textures, not editor-specific code, so they
+# live and get copied alongside them here rather than from editor/CMakeLists.txt.
+set(POLYIZON_MODEL_SOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/models")
+set(POLYIZON_MODEL_OUTPUT_DIR "${CMAKE_BINARY_DIR}/bin/models")
+set(POLYIZON_MODEL_SOURCES
+    ${POLYIZON_MODEL_SOURCE_DIR}/plane.obj
+    ${POLYIZON_MODEL_SOURCE_DIR}/cube.obj
+)
+
+set(POLYIZON_MODEL_OUTPUTS "")
+foreach(model_source ${POLYIZON_MODEL_SOURCES})
+    get_filename_component(model_name ${model_source} NAME)
+    set(model_output "${POLYIZON_MODEL_OUTPUT_DIR}/${model_name}")
+
+    add_custom_command(
+        OUTPUT ${model_output}
+        COMMAND ${CMAKE_COMMAND} -E make_directory ${POLYIZON_MODEL_OUTPUT_DIR}
+        COMMAND ${CMAKE_COMMAND} -E copy ${model_source} ${model_output}
+        DEPENDS ${model_source}
+        COMMENT "Copying model ${model_name}"
+        VERBATIM
+    )
+    list(APPEND POLYIZON_MODEL_OUTPUTS ${model_output})
+endforeach()
+
+add_custom_target(polyizon_models DEPENDS ${POLYIZON_MODEL_OUTPUTS})
+add_dependencies(polyizon_core polyizon_models)
