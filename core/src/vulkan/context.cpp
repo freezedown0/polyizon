@@ -1,3 +1,21 @@
+// <Windows.h> must be included before volk.h/<vulkan/vulkan.h> in this TU:
+// VK_USE_PLATFORM_WIN32_KHR (below) makes vulkan.h pull in
+// <vulkan/vulkan_win32.h>, which assumes HWND/HINSTANCE/etc. are already
+// declared by a prior <Windows.h> include — this is the Vulkan headers'
+// own documented requirement for that platform macro, not a project
+// convention. NOMINMAX avoids Windows.h's min/max macros shadowing
+// std::min/std::max used elsewhere in this file.
+#define WIN32_LEAN_AND_MEAN
+#define NOMINMAX
+#include <Windows.h>
+
+// Enables the Win32 surface path (vkCreateWin32SurfaceKHR,
+// VkWin32SurfaceCreateInfoKHR) used by CreateSurfaceWin32() below, for the
+// Qt-hosted editor viewport. Scoped to this TU only (not a project-wide
+// compile definition) so no other translation unit's view of <volk.h>
+// changes.
+#define VK_USE_PLATFORM_WIN32_KHR
+
 // VOLK_IMPLEMENTATION must be defined before volk.h's *first* inclusion in
 // this translation unit — context.hpp itself includes <volk.h> (for the
 // public VkInstance/etc. types), so this #define has to come first here.
@@ -68,10 +86,24 @@ bool CheckValidationLayerSupport() {
 }
 #endif
 
-std::vector<const char*> GetRequiredInstanceExtensions() {
+std::vector<const char*> GetRequiredInstanceExtensionsGlfw() {
     std::uint32_t glfwExtensionCount = 0;
     const char** glfwExtensions = glfwGetRequiredInstanceExtensions(&glfwExtensionCount);
     std::vector<const char*> extensions(glfwExtensions, glfwExtensions + glfwExtensionCount);
+
+#ifdef POLYIZON_ENABLE_VALIDATION
+    extensions.push_back(VK_EXT_DEBUG_UTILS_EXTENSION_NAME);
+#endif
+
+    return extensions;
+}
+
+// Static list, not queried from any windowing library: these are exactly
+// what glfwGetRequiredInstanceExtensions() also returns on Windows (surface
+// + the Win32-specific surface extension) — not actually GLFW-derived
+// information, just always-true facts about presenting to a Win32 HWND.
+std::vector<const char*> GetRequiredInstanceExtensionsWin32() {
+    std::vector<const char*> extensions = { VK_KHR_SURFACE_EXTENSION_NAME, VK_KHR_WIN32_SURFACE_EXTENSION_NAME };
 
 #ifdef POLYIZON_ENABLE_VALIDATION
     extensions.push_back(VK_EXT_DEBUG_UTILS_EXTENSION_NAME);
@@ -160,19 +192,36 @@ VulkanContext::VulkanContext(Window& window, const std::string& appName) {
     }
     volkInitializeCustom(getInstanceProcAddr);
 
-    CreateInstance(appName);
+    CreateInstance(appName, GetRequiredInstanceExtensionsGlfw());
     SetupDebugMessenger();
     CreateSurface(window);
-    SelectPhysicalDevice();
-    CreateLogicalDevice();
-    CreateAllocator();
+    InitializeCommon();
+}
+
+VulkanContext::VulkanContext(HWND hwnd, HINSTANCE hinstance, const std::string& appName) {
+    // No GLFW involved on this path at all: volk's own bootstrap (which the
+    // GLFW constructor avoids specifically because vcpkg's precompiled
+    // volk::volk crashed in its genload code — see core/CMakeLists.txt) is
+    // fine here because this project never links that precompiled lib;
+    // volkInitialize() just does the same LoadLibrary+GetProcAddress dance
+    // against vulkan-1.dll using the volk source compiled directly into
+    // this TU (VOLK_IMPLEMENTATION above), which has never been the
+    // problematic path.
+    if (volkInitialize() != VK_SUCCESS) {
+        throw std::runtime_error("Failed to initialize volk");
+    }
+
+    CreateInstance(appName, GetRequiredInstanceExtensionsWin32());
+    SetupDebugMessenger();
+    CreateSurfaceWin32(hwnd, hinstance);
+    InitializeCommon();
 }
 
 VulkanContext::~VulkanContext() {
     Destroy();
 }
 
-void VulkanContext::CreateInstance(const std::string& appName) {
+void VulkanContext::CreateInstance(const std::string& appName, const std::vector<const char*>& extensions) {
 #ifdef POLYIZON_ENABLE_VALIDATION
     if (!CheckValidationLayerSupport()) {
         throw std::runtime_error(
@@ -188,8 +237,6 @@ void VulkanContext::CreateInstance(const std::string& appName) {
     appInfo.pEngineName = "Polyizon";
     appInfo.engineVersion = VK_MAKE_VERSION(1, 0, 0);
     appInfo.apiVersion = VK_API_VERSION_1_3;
-
-    const std::vector<const char*> extensions = GetRequiredInstanceExtensions();
 
     VkInstanceCreateInfo createInfo{};
     createInfo.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO;
@@ -229,6 +276,23 @@ void VulkanContext::CreateSurface(Window& window) {
     if (glfwCreateWindowSurface(m_Instance, window.GetNativeHandle(), nullptr, &m_Surface) != VK_SUCCESS) {
         throw std::runtime_error("Failed to create Vulkan surface");
     }
+}
+
+void VulkanContext::CreateSurfaceWin32(HWND hwnd, HINSTANCE hinstance) {
+    VkWin32SurfaceCreateInfoKHR createInfo{};
+    createInfo.sType = VK_STRUCTURE_TYPE_WIN32_SURFACE_CREATE_INFO_KHR;
+    createInfo.hinstance = hinstance;
+    createInfo.hwnd = hwnd;
+
+    if (vkCreateWin32SurfaceKHR(m_Instance, &createInfo, nullptr, &m_Surface) != VK_SUCCESS) {
+        throw std::runtime_error("Failed to create Vulkan Win32 surface");
+    }
+}
+
+void VulkanContext::InitializeCommon() {
+    SelectPhysicalDevice();
+    CreateLogicalDevice();
+    CreateAllocator();
 }
 
 void VulkanContext::SelectPhysicalDevice() {

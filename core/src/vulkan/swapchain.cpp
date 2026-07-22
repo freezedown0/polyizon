@@ -68,7 +68,18 @@ VkFormat ChooseDepthFormat(VkPhysicalDevice physicalDevice) {
 
 Swapchain::Swapchain(VulkanContext& context, Window& window)
     : m_Context(context)
-    , m_Window(window) {
+    , m_Window(&window) {
+    CreateSwapchain();
+    CreateImageViews();
+    m_DepthFormat = ChooseDepthFormat(m_Context.GetPhysicalDevice());
+    CreateDepthResources();
+    CreateRenderFinishedSemaphores();
+}
+
+Swapchain::Swapchain(VulkanContext& context, std::uint32_t width, std::uint32_t height)
+    : m_Context(context)
+    , m_Width(width)
+    , m_Height(height) {
     CreateSwapchain();
     CreateImageViews();
     m_DepthFormat = ChooseDepthFormat(m_Context.GetPhysicalDevice());
@@ -78,6 +89,14 @@ Swapchain::Swapchain(VulkanContext& context, Window& window)
 
 Swapchain::~Swapchain() {
     Destroy();
+}
+
+std::uint32_t Swapchain::GetCurrentWidth() const noexcept {
+    return m_Window ? m_Window->GetWidth() : m_Width;
+}
+
+std::uint32_t Swapchain::GetCurrentHeight() const noexcept {
+    return m_Window ? m_Window->GetHeight() : m_Height;
 }
 
 void Swapchain::CreateSwapchain() {
@@ -99,7 +118,7 @@ void Swapchain::CreateSwapchain() {
 
     const VkSurfaceFormatKHR surfaceFormat = ChooseSurfaceFormat(formats);
     const VkPresentModeKHR presentMode = ChoosePresentMode(presentModes);
-    const VkExtent2D extent = ChooseExtent(capabilities, m_Window.GetWidth(), m_Window.GetHeight());
+    const VkExtent2D extent = ChooseExtent(capabilities, GetCurrentWidth(), GetCurrentHeight());
 
     std::uint32_t imageCount = capabilities.minImageCount + 1;
     if (capabilities.maxImageCount > 0) {
@@ -205,7 +224,7 @@ void Swapchain::CreateRenderFinishedSemaphores() {
 }
 
 Swapchain::AcquireResult Swapchain::AcquireNextImage(VkSemaphore imageAvailableSemaphore, std::uint32_t& outImageIndex) {
-    if (m_Window.GetWidth() == 0 || m_Window.GetHeight() == 0) {
+    if (GetCurrentWidth() == 0 || GetCurrentHeight() == 0) {
         m_NeedsRecreate = true;
         return AcquireResult::NotReady; // never touch Vulkan with a zero extent
     }
@@ -255,7 +274,7 @@ void Swapchain::Recreate() {
     vkDeviceWaitIdle(m_Context.GetDevice());
     DestroySwapchainResources();
 
-    if (m_Window.GetWidth() == 0 || m_Window.GetHeight() == 0) {
+    if (GetCurrentWidth() == 0 || GetCurrentHeight() == 0) {
         m_NeedsRecreate = true; // stay minimized; AcquireNextImage's guard keeps returning NotReady
         return;
     }

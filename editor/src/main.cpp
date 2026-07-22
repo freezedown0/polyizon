@@ -1,16 +1,16 @@
-#include "polyizon/core.hpp"
+#include "main_window.hpp"
 
-// Placeholder entry point. The editor UI (ImGui panels, viewport, inspector)
-// is not implemented yet — this just proves the target links against
-// polyizon_core and drives the same window lifecycle as the game target.
-int main() {
-    polyizon::ApplicationSpec spec;
-    spec.name = "Polyizon Editor";
-    spec.windowWidth = 1600;
-    spec.windowHeight = 900;
+#include <QApplication>
 
-    polyizon::Application app(spec);
-    app.Run();
+// Qt owns the editor's window/event loop entirely — no polyizon::Application/
+// Window/GLFW involved on this path at all (see VulkanViewportWindow /
+// EditorViewportRenderer). The game client (game/src/main.cpp) is untouched
+// and still uses polyizon::Application as before.
+int main(int argc, char** argv) {
+    QApplication app(argc, argv);
 
-    return 0;
+    MainWindow window;
+    window.show();
+
+    return app.exec();
 }

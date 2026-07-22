@@ -32,6 +32,14 @@ class Window;
 class Swapchain {
 public:
     Swapchain(VulkanContext& context, Window& window);
+
+    // Additive: width/height supplied directly by the caller instead of a
+    // live Window& query — used by the Qt-hosted editor viewport, which has
+    // no Window/GLFW object at all. Same "which windowing system provided
+    // the surface" split as VulkanContext's two constructors; the GLFW
+    // constructor above is untouched.
+    Swapchain(VulkanContext& context, std::uint32_t width, std::uint32_t height);
+
     ~Swapchain();
 
     Swapchain(const Swapchain&) = delete;
@@ -49,8 +57,20 @@ public:
     void Present(VkSemaphore waitSemaphore, std::uint32_t imageIndex);
 
     // Called from Application::OnWindowResize. Recreation itself is deferred
-    // to the next AcquireNextImage() call, never done synchronously here.
+    // to the next AcquireNextImage() call, never done synchronously here. The
+    // GLFW-constructed path re-reads the live Window& at that later point, so
+    // no new size needs to travel through this call.
     void NotifyResized() noexcept { m_NeedsRecreate = true; }
+
+    // Win32/Qt-path equivalent of NotifyResized(): there's no Window& to
+    // re-query later, so the caller (VulkanViewportWindow::resizeEvent)
+    // passes the new size directly. Also deferred to the next
+    // AcquireNextImage() call, same as the GLFW path.
+    void Resize(std::uint32_t width, std::uint32_t height) noexcept {
+        m_Width = width;
+        m_Height = height;
+        m_NeedsRecreate = true;
+    }
 
     VkFormat GetImageFormat() const noexcept { return m_ImageFormat; }
     VkExtent2D GetExtent() const noexcept { return m_Extent; }
@@ -73,8 +93,22 @@ private:
     void DestroyDepthResources();
     void Destroy();
 
+    // Current width/height, regardless of which constructor was used: the
+    // GLFW path re-reads the live Window& (m_Window non-null); the Win32/Qt
+    // path returns the last size passed to Resize() (m_Window null, see the
+    // second constructor). Defined in the .cpp, not inline here: calling
+    // Window::GetWidth()/GetHeight() needs its complete type, and this header
+    // only forward-declares Window.
+    std::uint32_t GetCurrentWidth() const noexcept;
+    std::uint32_t GetCurrentHeight() const noexcept;
+
     VulkanContext& m_Context;
-    Window& m_Window;
+    // Non-owning; null when constructed via the Win32/Qt-facing overload,
+    // which has no Window/GLFW object to point at (see GetCurrentWidth/Height
+    // and the Resize()-based path above).
+    Window* m_Window = nullptr;
+    std::uint32_t m_Width = 0;
+    std::uint32_t m_Height = 0;
 
     VkSwapchainKHR m_Swapchain = VK_NULL_HANDLE;
     VkFormat m_ImageFormat = VK_FORMAT_UNDEFINED;

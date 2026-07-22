@@ -33,3 +33,10 @@ find_package(VulkanMemoryAllocator CONFIG REQUIRED)
 # reading its own printed usage instructions, same discipline as every
 # other dependency here.
 find_package(Stb REQUIRED)
+
+# Qt6 is NOT found here deliberately: it's only needed by editor/CMakeLists.txt
+# (target: Qt6::Widgets), not by core/game. Putting it in this shared file
+# would make every configure of the whole project (including the GLFW-only
+# game client) require Qt6 to be installed — editor/CMakeLists.txt calls
+# find_package(Qt6 ...) itself instead, scoped to the target that actually
+# needs it.

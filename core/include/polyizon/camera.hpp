@@ -25,7 +25,17 @@ public:
     // Polls WASD + Space/Left-Shift via glfwGetKey each call. NOT driven by
     // Window's KeyCallback: that fires only on press/release transitions and
     // can't produce smooth, deltaTime-scaled motion while a key is held.
+    // Thin wrapper around the GLFW-agnostic overload below — kept for the
+    // GLFW-driven game client; a Qt-hosted caller (no GLFWwindow*) tracks its
+    // own held-key state and calls that overload directly.
     void ProcessKeyboard(GLFWwindow* window, float deltaTime);
+
+    // The real implementation: each flag is "is this movement direction
+    // currently held", already resolved by the caller from whatever input
+    // system it owns (GLFW polling, Qt key events, etc.) — this class has no
+    // windowing-system dependency beyond this header's forward-declared
+    // GLFWwindow* for the convenience overload above.
+    void ProcessKeyboard(bool forward, bool backward, bool left, bool right, bool up, bool down, float deltaTime);
 
     // xOffset/yOffset are RAW pixel deltas since the last sample (computed by
     // the caller from consecutive CursorPosCallback invocations), already

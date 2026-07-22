@@ -25,14 +25,25 @@ glm::mat4 Camera::GetViewMatrix() const {
 }
 
 void Camera::ProcessKeyboard(GLFWwindow* window, float deltaTime) {
+    ProcessKeyboard(
+        glfwGetKey(window, GLFW_KEY_W) == GLFW_PRESS,
+        glfwGetKey(window, GLFW_KEY_S) == GLFW_PRESS,
+        glfwGetKey(window, GLFW_KEY_A) == GLFW_PRESS,
+        glfwGetKey(window, GLFW_KEY_D) == GLFW_PRESS,
+        glfwGetKey(window, GLFW_KEY_SPACE) == GLFW_PRESS,
+        glfwGetKey(window, GLFW_KEY_LEFT_SHIFT) == GLFW_PRESS,
+        deltaTime);
+}
+
+void Camera::ProcessKeyboard(bool forward, bool backward, bool left, bool right, bool up, bool down, float deltaTime) {
     const float velocity = movementSpeed * deltaTime;
 
-    if (glfwGetKey(window, GLFW_KEY_W) == GLFW_PRESS) m_Position += m_Front * velocity;
-    if (glfwGetKey(window, GLFW_KEY_S) == GLFW_PRESS) m_Position -= m_Front * velocity;
-    if (glfwGetKey(window, GLFW_KEY_A) == GLFW_PRESS) m_Position -= m_Right * velocity;
-    if (glfwGetKey(window, GLFW_KEY_D) == GLFW_PRESS) m_Position += m_Right * velocity;
-    if (glfwGetKey(window, GLFW_KEY_SPACE) == GLFW_PRESS) m_Position += m_WorldUp * velocity;
-    if (glfwGetKey(window, GLFW_KEY_LEFT_SHIFT) == GLFW_PRESS) m_Position -= m_WorldUp * velocity;
+    if (forward) m_Position += m_Front * velocity;
+    if (backward) m_Position -= m_Front * velocity;
+    if (left) m_Position -= m_Right * velocity;
+    if (right) m_Position += m_Right * velocity;
+    if (up) m_Position += m_WorldUp * velocity;
+    if (down) m_Position -= m_WorldUp * velocity;
 }
 
 void Camera::ProcessMouseMovement(float xOffset, float yOffset) {

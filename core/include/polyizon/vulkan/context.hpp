@@ -4,6 +4,7 @@
 
 #include <cstdint>
 #include <string>
+#include <vector>
 
 // VmaAllocator is an opaque-pointer typedef (VK_DEFINE_HANDLE-style) that
 // vk_mem_alloc.h declares in the global namespace; forward-declared here at
@@ -11,6 +12,17 @@
 // this header don't need to see vk_mem_alloc.h.
 struct VmaAllocator_T;
 using VmaAllocator = VmaAllocator_T*;
+
+// HWND/HINSTANCE are opaque-pointer typedefs in WinDef.h (`typedef struct
+// HWND__* HWND;` etc) — forward-declared here at matching global scope
+// (identical trick to VmaAllocator above) so this header doesn't need to
+// pull in <Windows.h> just to name these two types in the Win32-surface
+// constructor overload below. context.cpp includes the real <Windows.h>/
+// <vulkan/vulkan_win32.h> to implement that overload.
+struct HWND__;
+using HWND = HWND__*;
+struct HINSTANCE__;
+using HINSTANCE = HINSTANCE__*;
 
 namespace polyizon {
 
@@ -23,6 +35,15 @@ class Window;
 class VulkanContext {
 public:
     VulkanContext(Window& window, const std::string& appName);
+
+    // Additive Win32 surface path: used by the Qt-hosted editor viewport,
+    // which owns its own native window/event loop (not GLFW) — hwnd/hinstance
+    // come from a QWindow's winId()/GetModuleHandle(nullptr). Everything past
+    // instance/surface creation (physical device, logical device, allocator)
+    // is shared with the GLFW constructor via InitializeCommon(); it only
+    // ever touches m_Instance/m_Surface/m_PhysicalDevice, never Window/GLFW.
+    VulkanContext(HWND hwnd, HINSTANCE hinstance, const std::string& appName);
+
     ~VulkanContext();
 
     VulkanContext(const VulkanContext&) = delete;
@@ -44,12 +65,17 @@ public:
     std::uint32_t GetGraphicsQueueFamily() const noexcept { return m_QueueFamily; }
 
 private:
-    void CreateInstance(const std::string& appName);
+    void CreateInstance(const std::string& appName, const std::vector<const char*>& extensions);
     void SetupDebugMessenger();
     void CreateSurface(Window& window);
+    void CreateSurfaceWin32(HWND hwnd, HINSTANCE hinstance);
     void SelectPhysicalDevice();
     void CreateLogicalDevice();
     void CreateAllocator();
+    // Shared tail of both constructors — physical device selection through
+    // VMA allocator creation, identical regardless of which windowing system
+    // provided the surface.
+    void InitializeCommon();
     void Destroy();
 
     VkInstance m_Instance = VK_NULL_HANDLE;
