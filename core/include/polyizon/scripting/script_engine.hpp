@@ -9,12 +9,16 @@
 #include <string>
 #include <unordered_map>
 
-// The engine's first (and only, this phase) scripting runtime: Lua via
-// sol2. Deliberately small API surface exposed to scripts — just a
-// TransformComponent (position/rotation/scale) and deltaTime, no full
-// ECS/registry access — see the Phase 16 plan for why (this proves the
-// binding round-trips correctly; a broader script API is a later phase's
-// concern once real gameplay needs exist).
+namespace polyizon {
+
+// The engine's scripting runtime: Lua via sol2. Deliberately small API
+// surface exposed to scripts — just a TransformComponent (position/rotation/
+// scale) and deltaTime, no full ECS/registry access — see the Phase 16 plan
+// for why (this proves the binding round-trips correctly; a broader script
+// API is a later phase's concern once real gameplay needs exist). Lives in
+// core (Phase 20) rather than editor-only — the standalone game client runs
+// scripts too, to make a compiled/exported project actually playable outside
+// the editor (see Application's project mode).
 //
 // Each distinct script file gets its own sol::environment (a private globals
 // table layered over the shared Lua state) rather than sharing one global
@@ -46,3 +50,5 @@ private:
     sol::state m_Lua;
     std::unordered_map<std::string, LoadedScript> m_LoadedScripts;
 };
+
+} // namespace polyizon

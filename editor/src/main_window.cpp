@@ -3,10 +3,13 @@
 #include "console_panel.hpp"
 #include "content_browser_panel.hpp"
 #include "editor_viewport_renderer.hpp"
+#include "game_builder.hpp"
 #include "hierarchy_panel.hpp"
 #include "inspector_panel.hpp"
-#include "scene_serializer.hpp"
+#include "lighting_settings_dialog.hpp"
 #include "vulkan_viewport_window.hpp"
+
+#include "polyizon/scene/scene_serializer.hpp"
 
 #include <entt/entt.hpp>
 
@@ -19,6 +22,7 @@
 #include <QMenuBar>
 #include <QMessageBox>
 #include <QTimer>
+#include <QToolBar>
 #include <QWidget>
 
 #include <filesystem>
@@ -64,6 +68,9 @@ MainWindow::MainWindow(QWidget* parent)
     contentBrowserDock->raise(); // shown on top of the tab group initially
 
     connect(m_HierarchyPanel, &HierarchyPanel::EntitySelected, m_InspectorPanel, &InspectorPanel::SetSelectedEntity);
+    // Phase 20: the viewport gizmo needs to know the current selection too
+    // (to know what to draw/drag) — same signal, a second slot.
+    connect(m_HierarchyPanel, &HierarchyPanel::EntitySelected, m_ViewportWindow, &VulkanViewportWindow::SetSelectedEntity);
     connect(m_ContentBrowserPanel, &ContentBrowserPanel::SceneFileActivated, this, &MainWindow::LoadSceneFile);
     // Covers both LoadScene() paths (synchronous and the exposeEvent-deferred
     // one — see VulkanViewportWindow::SceneLoaded's doc comment) rather than
@@ -71,6 +78,7 @@ MainWindow::MainWindow(QWidget* parent)
     // case entirely.
     connect(m_ViewportWindow, &VulkanViewportWindow::SceneLoaded, m_HierarchyPanel, &HierarchyPanel::Refresh);
     connect(m_ViewportWindow, &VulkanViewportWindow::SceneLoaded, this, &MainWindow::SyncLightingModeMenu);
+    connect(m_ViewportWindow, &VulkanViewportWindow::SceneLoaded, this, &MainWindow::UpdatePlayActionsEnabled);
 
     QMenu* fileMenu = menuBar()->addMenu("&File");
     fileMenu->addAction("&New Project...", this, &MainWindow::OnNewProject);
@@ -78,6 +86,9 @@ MainWindow::MainWindow(QWidget* parent)
     fileMenu->addSeparator();
     m_SaveSceneAction = fileMenu->addAction("&Save Scene", QKeySequence::Save, this, &MainWindow::OnSaveScene);
     m_SaveSceneAction->setEnabled(false); // nothing to save until a project/scene is loaded
+    fileMenu->addSeparator();
+    m_BuildGameAction = fileMenu->addAction("&Build Game...", this, &MainWindow::OnBuildGame);
+    m_BuildGameAction->setEnabled(false); // nothing to export until a project is loaded
 
     // Realistic/Voxel: a live in-memory toggle on whichever scene is
     // currently loaded (see SetLightingMode) — not a global editor setting,
@@ -100,6 +111,48 @@ MainWindow::MainWindow(QWidget* parent)
     lightingModeGroup->addAction(m_VoxelLightingAction);
     connect(m_VoxelLightingAction, &QAction::triggered, this,
         [this]() { SetLightingMode(polyizon::LightingMode::Voxel); });
+
+    lightingMenu->addSeparator();
+    lightingMenu->addAction("&Settings...", this, &MainWindow::OnOpenLightingSettings);
+
+    // Play/Pause/Stop (Phase 19) — see EditorViewportRenderer::PlayState.
+    // Same QAction objects added to both a menu (keyboard/menu-driven access)
+    // and a toolbar (one-click access, standard for this kind of
+    // frequently-used editor action) rather than duplicating them.
+    QMenu* playMenu = menuBar()->addMenu("&Play");
+    m_PlayAction = playMenu->addAction("&Play", this, &MainWindow::OnPlay);
+    m_PauseAction = playMenu->addAction("Pa&use", this, &MainWindow::OnPause);
+    m_StopAction = playMenu->addAction("&Stop", this, &MainWindow::OnStop);
+
+    QToolBar* playToolBar = addToolBar("Play");
+    playToolBar->addAction(m_PlayAction);
+    playToolBar->addAction(m_PauseAction);
+    playToolBar->addAction(m_StopAction);
+
+    UpdatePlayActionsEnabled(); // nothing loaded yet -> all disabled until a scene loads
+
+    // Move/Rotate viewport gizmo toggle (Phase 20) — exclusive toolbar
+    // buttons, same QActionGroup pattern as the Lighting mode toggle above.
+    // Move is the default (matches EditorViewportRenderer::m_GizmoMode).
+    QToolBar* gizmoToolBar = addToolBar("Gizmo");
+    auto* gizmoModeGroup = new QActionGroup(this);
+    gizmoModeGroup->setExclusive(true);
+
+    QAction* moveGizmoAction = gizmoToolBar->addAction("Move");
+    moveGizmoAction->setCheckable(true);
+    moveGizmoAction->setChecked(true);
+    gizmoModeGroup->addAction(moveGizmoAction);
+    connect(moveGizmoAction, &QAction::triggered, this,
+        [this]() { m_ViewportWindow->SetGizmoMode(polyizon::GizmoMode::Move); });
+
+    QAction* rotateGizmoAction = gizmoToolBar->addAction("Rotate");
+    rotateGizmoAction->setCheckable(true);
+    gizmoModeGroup->addAction(rotateGizmoAction);
+    connect(rotateGizmoAction, &QAction::triggered, this,
+        [this]() { m_ViewportWindow->SetGizmoMode(polyizon::GizmoMode::Rotate); });
+
+    QMenu* helpMenu = menuBar()->addMenu("&Help");
+    helpMenu->addAction("&Credits...", this, &MainWindow::OnCredits);
 
     m_RenderTimer = new QTimer(this);
     connect(m_RenderTimer, &QTimer::timeout, this, [this]() {
@@ -131,6 +184,7 @@ void MainWindow::OnNewProject() {
 
     setWindowTitle(QString("Polyizon Editor - %1").arg(QString::fromStdString(m_CurrentProject->GetName())));
     m_ContentBrowserPanel->SetRootDirectory(m_CurrentProject->GetRootDir());
+    m_BuildGameAction->setEnabled(true);
     LoadSceneFile(m_CurrentProject->GetDefaultScenePath());
 }
 
@@ -150,6 +204,7 @@ void MainWindow::OnOpenProject() {
 
     setWindowTitle(QString("Polyizon Editor - %1").arg(QString::fromStdString(m_CurrentProject->GetName())));
     m_ContentBrowserPanel->SetRootDirectory(m_CurrentProject->GetRootDir());
+    m_BuildGameAction->setEnabled(true);
     LoadSceneFile(m_CurrentProject->GetDefaultScenePath());
 }
 
@@ -159,11 +214,40 @@ void MainWindow::OnSaveScene() {
         return;
     }
 
+    // Saving mid-Play persists whatever Play has mutated straight to disk —
+    // the single most consequential "edit" the heads-up in
+    // MaybeWarnEditDuringPlay covers, so it applies here too even though
+    // Save Scene itself isn't blocked (see the class doc comment / the
+    // user's explicit "no locking" call for this phase).
+    m_ViewportWindow->MaybeWarnEditDuringPlay(this);
+
     try {
-        ::SaveScene(renderer->GetScene(), *m_CurrentScenePath);
+        polyizon::SaveScene(renderer->GetScene(), *m_CurrentScenePath);
     } catch (const std::exception& e) {
         QMessageBox::critical(this, "Failed to save scene", e.what());
     }
+}
+
+void MainWindow::OnBuildGame() {
+    if (!m_CurrentProject) {
+        return; // nothing to export until a project is loaded
+    }
+
+    const QString outputDir = QFileDialog::getExistingDirectory(this, "Choose an output folder for the built game");
+    if (outputDir.isEmpty()) {
+        return; // user cancelled
+    }
+
+    try {
+        ::BuildGame(*m_CurrentProject, std::filesystem::path(outputDir.toStdWString()));
+    } catch (const std::exception& e) {
+        QMessageBox::critical(this, "Failed to build game", e.what());
+        return;
+    }
+
+    QMessageBox::information(this, "Build Game",
+        QString("\"%1\" was built successfully to:\n%2").arg(
+            QString::fromStdString(m_CurrentProject->GetName()), outputDir));
 }
 
 void MainWindow::LoadSceneFile(const std::filesystem::path& scenePath) {
@@ -177,6 +261,79 @@ void MainWindow::LoadSceneFile(const std::filesystem::path& scenePath) {
     m_CurrentScenePath = scenePath;
     m_SaveSceneAction->setEnabled(true);
     m_InspectorPanel->SetSelectedEntity(entt::null);
+    m_ViewportWindow->SetSelectedEntity(entt::null);
+    // A new scene always starts Stopped (see EditorViewportRenderer::
+    // LoadScene) — UpdatePlayActionsEnabled() is also connected to
+    // SceneLoaded, but that fires the deferred exposeEvent-path load too,
+    // which this call already covers for the synchronous path.
+    UpdatePlayActionsEnabled();
+}
+
+void MainWindow::OnPlay() {
+    polyizon::EditorViewportRenderer* renderer = m_ViewportWindow->GetRenderer();
+    if (!renderer) {
+        return;
+    }
+    if (renderer->GetPlayState() == polyizon::PlayState::Stopped) {
+        // A fresh Play session — the one-time edit-during-play heads-up
+        // should be able to fire again (it's per-session, not per-app-run).
+        m_ViewportWindow->ResetEditWarning();
+    }
+    renderer->Play();
+    UpdatePlayActionsEnabled();
+}
+
+void MainWindow::OnPause() {
+    polyizon::EditorViewportRenderer* renderer = m_ViewportWindow->GetRenderer();
+    if (!renderer) {
+        return;
+    }
+    renderer->Pause();
+    UpdatePlayActionsEnabled();
+}
+
+void MainWindow::OnStop() {
+    polyizon::EditorViewportRenderer* renderer = m_ViewportWindow->GetRenderer();
+    if (!renderer) {
+        return;
+    }
+    renderer->Stop();
+    // Stop() replaces m_Scene wholesale (reverting to the pre-Play snapshot),
+    // same "the old selection/hierarchy no longer necessarily mean anything"
+    // situation as LoadSceneFile — refresh the same way it does.
+    m_HierarchyPanel->Refresh();
+    m_InspectorPanel->SetSelectedEntity(entt::null);
+    m_ViewportWindow->SetSelectedEntity(entt::null);
+    SyncLightingModeMenu();
+    UpdatePlayActionsEnabled();
+}
+
+void MainWindow::OnOpenLightingSettings() {
+    if (!m_LightingSettingsDialog) {
+        m_LightingSettingsDialog = new LightingSettingsDialog(m_ViewportWindow, this);
+    }
+    m_LightingSettingsDialog->show();
+    m_LightingSettingsDialog->raise();
+    m_LightingSettingsDialog->activateWindow();
+}
+
+void MainWindow::OnCredits() {
+    QMessageBox::about(this, "Credits",
+        "<h3>Polyizon</h3>"
+        "<p><b>Freezedown</b> &mdash; Creator</p>"
+        "<p><b>Claude</b> &mdash; Assistance</p>");
+}
+
+void MainWindow::UpdatePlayActionsEnabled() {
+    polyizon::EditorViewportRenderer* renderer = m_ViewportWindow->GetRenderer();
+    // Same gate as m_SaveSceneAction: Play/Pause/Stop are meaningless with no
+    // scene loaded at all.
+    const bool hasScene = renderer != nullptr && m_CurrentScenePath.has_value();
+    const polyizon::PlayState state = renderer ? renderer->GetPlayState() : polyizon::PlayState::Stopped;
+
+    m_PlayAction->setEnabled(hasScene && state != polyizon::PlayState::Playing);
+    m_PauseAction->setEnabled(hasScene && state == polyizon::PlayState::Playing);
+    m_StopAction->setEnabled(hasScene && state != polyizon::PlayState::Stopped);
 }
 
 void MainWindow::SetLightingMode(polyizon::LightingMode mode) {

@@ -1,4 +1,4 @@
-#include "mesh_import.hpp"
+#include "polyizon/assets/mesh_import.hpp"
 
 #include <assimp/Importer.hpp>
 #include <assimp/postprocess.h>
@@ -9,7 +9,9 @@
 #include <stdexcept>
 #include <vector>
 
-std::shared_ptr<polyizon::Mesh> LoadMesh(polyizon::VulkanContext& context, const std::filesystem::path& path) {
+namespace polyizon {
+
+std::shared_ptr<Mesh> LoadMesh(VulkanContext& context, const std::filesystem::path& path) {
     Assimp::Importer importer;
     // Triangulate: this project's pipelines only ever draw triangle lists.
     // GenNormals: only used as a fallback for files that omit normals
@@ -36,10 +38,10 @@ std::shared_ptr<polyizon::Mesh> LoadMesh(polyizon::VulkanContext& context, const
     // not this phase's scope).
     const aiMesh* mesh = scene->mMeshes[0];
 
-    std::vector<polyizon::Vertex3D> vertices;
+    std::vector<Vertex3D> vertices;
     vertices.reserve(mesh->mNumVertices);
     for (unsigned int i = 0; i < mesh->mNumVertices; ++i) {
-        polyizon::Vertex3D vertex{};
+        Vertex3D vertex{};
         vertex.position = glm::vec3(mesh->mVertices[i].x, mesh->mVertices[i].y, mesh->mVertices[i].z);
         // mesh->HasNormals() is always true here in practice (aiProcess_GenNormals
         // guarantees it), guarded anyway rather than assumed.
@@ -61,5 +63,7 @@ std::shared_ptr<polyizon::Mesh> LoadMesh(polyizon::VulkanContext& context, const
         }
     }
 
-    return std::make_shared<polyizon::Mesh>(context, vertices, indices);
+    return std::make_shared<Mesh>(context, vertices, indices);
 }
+
+} // namespace polyizon

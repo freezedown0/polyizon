@@ -16,22 +16,6 @@ find_package(Qt6 CONFIG REQUIRED COMPONENTS Widgets)
 # resolved IMPORTED_LOCATION_DEBUG/RELEASE path below — never linked.
 find_package(Qt6QWindowsIntegrationPlugin CONFIG REQUIRED PATHS "${Qt6Gui_DIR}")
 
-# Assimp is this target's own dependency too, not core/game's — same
-# reasoning/scoping as Qt6 above (see mesh_import.hpp): only editor/
-# imports .obj/.fbx files, so the GLFW-only game client's configure never
-# needs Assimp installed either.
-find_package(assimp CONFIG REQUIRED)
-
-# Same reasoning/scoping again: Lua scripting (ScriptEngine, see
-# script_engine.hpp) and JSON scene/project serialization (SceneSerializer,
-# Project) are editor-only concerns this phase. lua has no CMake namespace
-# target (plain FindLua-style variables); sol2 is a header-only C++ wrapper
-# around it and does NOT pull lua in as its own dependency, so both are
-# found and linked explicitly.
-find_package(Lua REQUIRED)
-find_package(sol2 CONFIG REQUIRED)
-find_package(nlohmann_json CONFIG REQUIRED)
-
 add_executable(polyizon_editor)
 
 # Required for QObject-derived classes (MainWindow's Q_OBJECT) to have their
@@ -51,28 +35,26 @@ target_sources(polyizon_editor
         src/main_window.cpp
         src/vulkan_viewport_window.cpp
         src/editor_viewport_renderer.cpp
-        src/mesh_import.cpp
-        src/script_engine.cpp
-        src/scene_serializer.cpp
         src/project.cpp
+        src/game_builder.cpp
         src/hierarchy_panel.cpp
         src/inspector_panel.cpp
         src/content_browser_panel.cpp
         src/console_panel.cpp
+        src/lighting_settings_dialog.cpp
 )
 
-# Dependencies
+# Dependencies. assimp/Lua/sol2/nlohmann_json are no longer linked directly
+# here — they come in transitively via polyizon_core, which PUBLICly links
+# them now that ScriptEngine/SceneSerializer/mesh_import live there (Phase
+# 20) — project.cpp's own direct nlohmann::json usage still resolves fine
+# through that transitive include path.
 target_link_libraries(polyizon_editor
     PRIVATE
         polyizon_core
         Qt6::Widgets
         Vulkan::Vulkan
-        assimp::assimp
-        ${LUA_LIBRARIES}
-        sol2::sol2
-        nlohmann_json::nlohmann_json
 )
-target_include_directories(polyizon_editor PRIVATE ${LUA_INCLUDE_DIR})
 
 # C++ standard
 target_compile_features(polyizon_editor PRIVATE cxx_std_20)

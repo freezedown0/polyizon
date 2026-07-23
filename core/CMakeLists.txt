@@ -1,5 +1,15 @@
 # Core Engine Library Target
 
+# Scoped here (not cmake/DependencyManagement.cmake) even though they used to
+# be editor-only concerns — Phase 20 moved ScriptEngine/SceneSerializer/
+# mesh_import into core so the standalone game client can load a project's
+# scene/scripts/meshes at runtime too (see Application's project mode),
+# without duplicating this code between editor/ and game/.
+find_package(assimp CONFIG REQUIRED)
+find_package(Lua REQUIRED)
+find_package(sol2 CONFIG REQUIRED)
+find_package(nlohmann_json CONFIG REQUIRED)
+
 add_library(polyizon_core STATIC)
 
 # Public include directory
@@ -10,6 +20,7 @@ target_include_directories(polyizon_core
     PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/src
         ${Stb_INCLUDE_DIR}
+        ${LUA_INCLUDE_DIR}
         # Vendored imgui_impl_vulkan (see target_sources below for why).
         ${CMAKE_SOURCE_DIR}/third_party/imgui_impl_vulkan
 )
@@ -22,6 +33,8 @@ target_sources(polyizon_core
         src/application.cpp
         src/camera.cpp
         src/noise.cpp
+        src/project_manifest.cpp
+        src/game_scene_renderer.cpp
 
         # Vulkan abstraction layer
         src/vulkan/context.cpp
@@ -32,11 +45,18 @@ target_sources(polyizon_core
         src/vulkan/lit_pipeline.cpp
         src/vulkan/voxel_lit_pipeline.cpp
         src/vulkan/shadow_pipeline.cpp
+        src/vulkan/gizmo_pipeline.cpp
         src/vulkan/buffer.cpp
         src/vulkan/image.cpp
         src/vulkan/texture3d.cpp
         src/vulkan/mesh.cpp
         src/vulkan/shadow_map.cpp
+
+        # Asset import / scripting / scene serialization (moved from editor/
+        # in Phase 20 so the standalone game client can use them too)
+        src/assets/mesh_import.cpp
+        src/scripting/script_engine.cpp
+        src/scene/scene_serializer.cpp
 
         # Vendored imgui_impl_vulkan.cpp (see third_party/imgui_impl_vulkan/):
         # vcpkg's imgui port is installed WITHOUT its vulkan-binding feature
@@ -89,6 +109,10 @@ target_link_libraries(polyizon_core
         # via VOLK_IMPLEMENTATION, guaranteeing header/impl consistency.
         volk::volk_headers
         GPUOpen::VulkanMemoryAllocator
+        assimp::assimp
+        ${LUA_LIBRARIES}
+        sol2::sol2
+        nlohmann_json::nlohmann_json
 )
 
 # Compiler features
@@ -138,6 +162,8 @@ set(POLYIZON_SHADER_SOURCES
     ${POLYIZON_SHADER_SOURCE_DIR}/lit.frag
     ${POLYIZON_SHADER_SOURCE_DIR}/voxel_lit.frag
     ${POLYIZON_SHADER_SOURCE_DIR}/shadow.vert
+    ${POLYIZON_SHADER_SOURCE_DIR}/gizmo.vert
+    ${POLYIZON_SHADER_SOURCE_DIR}/gizmo.frag
 )
 
 set(POLYIZON_SHADER_OUTPUTS "")
@@ -192,10 +218,9 @@ add_dependencies(polyizon_core polyizon_textures)
 # --- 3D model asset copying ---
 # Models live in core/models/ (parallel to shaders/textures/). Copied
 # verbatim into <build>/bin/models — same directory both executables run
-# from — mirroring the texture-copy pattern above exactly. Only the editor
-# target loads these this phase (see editor/src/mesh_import.hpp), but models
-# are asset content like shaders/textures, not editor-specific code, so they
-# live and get copied alongside them here rather than from editor/CMakeLists.txt.
+# from — mirroring the texture-copy pattern above exactly. Loaded via
+# polyizon/assets/mesh_import.hpp (core) by both the editor and, since Phase
+# 20, a compiled game's own polyizon_editor.exe/polyizon.exe binary.
 set(POLYIZON_MODEL_SOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/models")
 set(POLYIZON_MODEL_OUTPUT_DIR "${CMAKE_BINARY_DIR}/bin/models")
 set(POLYIZON_MODEL_SOURCES
@@ -225,10 +250,9 @@ add_dependencies(polyizon_core polyizon_models)
 # --- Lua script asset copying ---
 # Built-in/sample scripts live in core/scripts/ (parallel to models/shaders/
 # textures/), copied verbatim into <build>/bin/scripts — mirroring the
-# model-copy pattern above exactly. Same "asset content, not editor-specific
-# code" reasoning as models: only the editor's ScriptEngine (see
-# editor/src/script_engine.hpp) loads these this phase, but they live here
-# alongside the other asset kinds rather than under editor/.
+# model-copy pattern above exactly. Loaded via polyizon/scripting/
+# script_engine.hpp (core) by both the editor and, since Phase 20, a compiled
+# game.
 set(POLYIZON_SCRIPT_SOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/scripts")
 set(POLYIZON_SCRIPT_OUTPUT_DIR "${CMAKE_BINARY_DIR}/bin/scripts")
 set(POLYIZON_SCRIPT_SOURCES

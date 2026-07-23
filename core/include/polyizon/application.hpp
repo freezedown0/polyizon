@@ -1,6 +1,7 @@
 #pragma once
 
 #include "polyizon/camera.hpp"
+#include "polyizon/game_scene_renderer.hpp"
 #include "polyizon/vulkan/buffer.hpp"
 #include "polyizon/vulkan/context.hpp"
 #include "polyizon/vulkan/image.hpp"
@@ -15,7 +16,9 @@
 
 #include <array>
 #include <cstdint>
+#include <filesystem>
 #include <memory>
+#include <optional>
 #include <string>
 
 namespace polyizon {
@@ -24,6 +27,16 @@ struct ApplicationSpec {
     std::string name = "Polyizon Application";
     std::uint32_t windowWidth = 1280;
     std::uint32_t windowHeight = 720;
+
+    // Phase 20: if set, Application runs in "project mode" — it loads and
+    // renders this project's default scene (via GameSceneRenderer) instead
+    // of the hardcoded quad/instancing demo, and runs every entity's Lua
+    // script each frame. This is what makes a "Build Game" export (see the
+    // editor's game_builder.hpp) actually playable: the exported folder's
+    // own project.json sits next to the game exe, and main.cpp points this
+    // at it. Left unset, Application behaves exactly as before (the
+    // hardcoded demo) — this field is purely additive.
+    std::optional<std::filesystem::path> projectDir;
 };
 
 // Owns the window and drives the main loop. Derive from this and override
@@ -65,7 +78,10 @@ private:
     void UpdateUniformBuffer(std::uint32_t frameIndex, VkExtent2D extent);
     void UpdateInstanceBuffer(std::uint32_t frameIndex, float time);
     void UpdateSkyUniformBuffer(std::uint32_t frameIndex, VkExtent2D extent, float time);
-    void RenderFrame();
+    void RenderFrame(float deltaTime);
+    // The original hardcoded quad/instancing/sky demo, unchanged since
+    // before Phase 20 — see RenderFrame()'s m_ProjectMode branch.
+    void RenderDemoFrame(VkCommandBuffer cmd, std::uint32_t imageIndex, VkExtent2D extent, float time);
     void InitImGui();
     void ShutdownImGui();
     void BuildDebugOverlay();
@@ -187,6 +203,14 @@ private:
 
     // Distance fog for the quad scene (see UpdateUniformBuffer()/triangle.frag).
     float m_FogDensity = 0.06f;
+
+    // Phase 20: project mode (see ApplicationSpec::projectDir). Constructed
+    // only if a project directory was given; RenderFrame() branches between
+    // this and the hardcoded demo above entirely based on m_ProjectMode, so
+    // the demo path (including every member above) is completely unaffected
+    // when this is unset.
+    bool m_ProjectMode = false;
+    std::unique_ptr<GameSceneRenderer> m_GameSceneRenderer;
 };
 
 } // namespace polyizon

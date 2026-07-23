@@ -1,15 +1,15 @@
 #pragma once
 
-#include "script_engine.hpp"
-
 #include "polyizon/camera.hpp"
 #include "polyizon/scene/components.hpp"
 #include "polyizon/scene/lighting_settings.hpp"
 #include "polyizon/scene/scene.hpp"
+#include "polyizon/scripting/script_engine.hpp"
 #include "polyizon/vulkan/buffer.hpp"
 #include "polyizon/vulkan/classic_sky_pipeline.hpp"
 #include "polyizon/vulkan/classic_sky_uniform_buffer_object.hpp"
 #include "polyizon/vulkan/context.hpp"
+#include "polyizon/vulkan/gizmo_pipeline.hpp"
 #include "polyizon/vulkan/lit_pipeline.hpp"
 #include "polyizon/vulkan/lit_uniform_buffer_object.hpp"
 #include "polyizon/vulkan/mesh.hpp"
@@ -21,13 +21,30 @@
 #include "polyizon/vulkan/texture3d.hpp"
 #include "polyizon/vulkan/voxel_lit_pipeline.hpp"
 
+#include <entt/entt.hpp>
+#include <nlohmann/json_fwd.hpp>
+
 #include <array>
 #include <chrono>
 #include <cstdint>
 #include <filesystem>
 #include <memory>
+#include <optional>
 
 namespace polyizon {
+
+// Phase 19: the editor's Play/Pause/Stop state (see EditorViewportRenderer::
+// Play()/Pause()/Stop()). Stopped is the default "editing" state — scripts
+// never run outside Playing (see RenderFrame()'s ScriptEngine::Update() gate).
+enum class PlayState { Stopped, Playing, Paused };
+
+// Phase 20: which viewport gizmo is drawn/interactive for the currently
+// selected entity (see SetGizmoMode()/SetSelectedEntity()) — Move draws
+// three axis arrows the user drags along; Rotate draws three axis rings the
+// user drags around. Always world-axis-aligned ("global" gizmo), never the
+// selected entity's own local rotation — simpler to pick/drag and matches
+// most editors' default mode.
+enum class GizmoMode { Move, Rotate };
 
 // Sibling to Application, not a refactor of it: owns the same Vulkan object
 // graph (context/swapchain/pipelines/frame-sync) and reproduces the relevant
@@ -101,7 +118,24 @@ public:
     // New/Open Project handlers). Waits for the GPU to finish with whatever
     // scene is currently loaded (its entities' Mesh GPU buffers must not be
     // in flight) before replacing m_Scene outright — see scene_serializer.hpp.
+    // Always leaves PlayState::Stopped (see Play()/Stop()) — a snapshot taken
+    // against a scene that's about to be replaced wouldn't mean anything.
     void LoadScene(const std::filesystem::path& sceneFile);
+
+    // Phase 19 Play/Pause/Stop. Stopped->Playing snapshots the current scene
+    // (via SerializeSceneToJson, see scene_serializer.hpp) so Stop() can
+    // revert to it; Paused->Playing (resume) does NOT re-snapshot, so Stop
+    // always reverts to how the scene looked right before Play was first
+    // pressed, not wherever Pause happened to catch it. Pause() only takes
+    // effect from Playing. Stop() only takes effect from Playing/Paused,
+    // restoring m_Scene from the snapshot (vkDeviceWaitIdle first, same
+    // "GPU must be done with the old scene's Mesh buffers" precedent as
+    // LoadScene()) and clearing it. See RenderFrame() for how PlayState gates
+    // ScriptEngine::Update().
+    void Play();
+    void Pause();
+    void Stop();
+    PlayState GetPlayState() const noexcept { return m_PlayState; }
 
     // Phase 17: editor panels (Hierarchy/Inspector/ContentBrowser, see
     // editor/src/*_panel.hpp) read and mutate the live scene directly through
@@ -111,6 +145,28 @@ public:
     // LoadScene() does internally.
     Scene& GetScene() noexcept { return m_Scene; }
     VulkanContext& GetVulkanContext() noexcept { return *m_VulkanContext; }
+
+    // Phase 20: Move/Rotate viewport gizmos. The renderer tracks the current
+    // selection itself (kept in sync with HierarchyPanel/InspectorPanel's own
+    // selection via VulkanViewportWindow — see its SetSelectedEntity) purely
+    // so it knows what to draw the gizmo for and what PickGizmoAxis/
+    // UpdateGizmoDrag should mutate; it's not itself a second source of
+    // truth for "what's selected in the UI."
+    void SetGizmoMode(GizmoMode mode) noexcept { m_GizmoMode = mode; }
+    GizmoMode GetGizmoMode() const noexcept { return m_GizmoMode; }
+    void SetSelectedEntity(entt::entity entity) noexcept { m_SelectedEntity = entity; }
+    entt::entity GetSelectedEntity() const noexcept { return m_SelectedEntity; }
+
+    // Viewport-pixel coordinates in, matching Qt's QMouseEvent::position()
+    // convention (origin top-left, Y down) — same space RenderGizmo()
+    // projects its handles into. Returns the axis (0=X, 1=Y, 2=Z) whose
+    // handle is closest to (mouseX, mouseY) within a small pick threshold,
+    // or -1 if nothing is close enough (or nothing selected).
+    int PickGizmoAxis(float mouseX, float mouseY) const;
+    void BeginGizmoDrag(int axis, float mouseX, float mouseY);
+    void UpdateGizmoDrag(float mouseX, float mouseY);
+    void EndGizmoDrag() noexcept { m_DraggingAxis = -1; }
+    bool IsDraggingGizmo() const noexcept { return m_DraggingAxis >= 0; }
 
 private:
     void CreateFrameSyncObjects();
@@ -126,9 +182,17 @@ private:
     // per-entity draw loop, only the bound pipeline/descriptor set differs
     // (which the caller has already bound before calling this).
     void DrawLitEntities(VkCommandBuffer cmd, VkPipelineLayout pipelineLayout);
+    // Rebuilds this frame's gizmo line geometry for the current selection/
+    // mode (CPU-side, in world space) and draws it — a no-op if nothing
+    // valid is selected. Drawn last, on top of the already-rendered scene
+    // (see GizmoPipeline: depth test/write both disabled).
+    void RenderGizmo(VkCommandBuffer cmd, VkExtent2D extent);
     float GetElapsedSeconds() const;
     glm::vec3 GetSunDirection() const;
     glm::mat4 GetLightSpaceMatrix() const;
+    // Shared by RenderGizmo/PickGizmoAxis/UpdateGizmoDrag so all three agree
+    // on exactly the same camera transform each frame.
+    glm::mat4 GetViewProjMatrix(VkExtent2D extent) const;
 
     static constexpr std::uint32_t kMaxFramesInFlight = 2;
     static constexpr std::uint32_t kRealisticShadowMapResolution = 2048;
@@ -164,6 +228,20 @@ private:
     // per-script environments; touches no Vulkan/GPU state, so its
     // declaration position here has no destruction-order implications.
     ScriptEngine m_ScriptEngine;
+
+    // Phase 19 Play/Pause/Stop (see Play()/Pause()/Stop() above). Holds the
+    // pre-Play scene snapshot (SerializeSceneToJson's output) only while
+    // Playing/Paused — null otherwise. nlohmann::json rather than a second
+    // Scene: Scene/entt::registry has no deep-copy support, and the JSON
+    // round-trip already exists for SceneSerializer, so reusing it needs no
+    // new machinery. unique_ptr (not optional/by-value) so this header only
+    // needs nlohmann::json forward-declared (json_fwd.hpp above) rather than
+    // its full definition — this class's copy/move are already deleted, so
+    // no special member function here needs the complete type; only
+    // ~EditorViewportRenderer() does, and it's defined out-of-line in the
+    // .cpp, which does see the full type via scene_serializer.hpp.
+    PlayState m_PlayState = PlayState::Stopped;
+    std::unique_ptr<nlohmann::json> m_PlaySnapshot;
 
     // LitUniformBufferObject's contents (view/proj/lightSpaceMatrix/
     // sunDirectionAndAmbient) don't differ between Realistic and Voxel — only
@@ -225,6 +303,22 @@ private:
     float m_CloudWindDirectionDegrees = 0.0f;
     int m_CloudPrimarySteps = 64;
     int m_CloudSunShadowSteps = 8;
+
+    // Phase 20: Move/Rotate viewport gizmos. Geometry is rebuilt CPU-side
+    // every frame (world-space line list, cheap — see RenderGizmo()) into a
+    // per-frame-in-flight host-visible buffer, rather than a static template
+    // + per-instance model matrix, so the exact same vertex positions used
+    // for rendering are also what PickGizmoAxis/UpdateGizmoDrag project to
+    // screen space — no risk of the two subtly disagreeing.
+    std::unique_ptr<GizmoPipeline> m_GizmoPipeline;
+    std::array<std::unique_ptr<Buffer>, kMaxFramesInFlight> m_GizmoVertexBuffers;
+    GizmoMode m_GizmoMode = GizmoMode::Move;
+    entt::entity m_SelectedEntity = entt::null;
+    // >=0 while a mouse drag on that axis (0=X/1=Y/2=Z) is in progress; see
+    // BeginGizmoDrag()/UpdateGizmoDrag()/EndGizmoDrag().
+    int m_DraggingAxis = -1;
+    float m_LastDragMouseX = 0.0f;
+    float m_LastDragMouseY = 0.0f;
 };
 
 } // namespace polyizon

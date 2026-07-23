@@ -1,19 +1,110 @@
 #include "editor_viewport_renderer.hpp"
 
-#include "scene_serializer.hpp"
-
 #include "polyizon/log.hpp"
+#include "polyizon/scene/scene_serializer.hpp"
 #include "polyizon/noise.hpp"
 
+#include <glm/gtc/constants.hpp>
 #include <glm/gtc/matrix_transform.hpp>
+
+// Full nlohmann::json definition — editor_viewport_renderer.hpp only forward-
+// declares it (via json_fwd.hpp) for m_PlaySnapshot's unique_ptr<json>, but
+// Play()/Stop() below construct/dereference one directly, which needs the
+// complete type.
+#include <nlohmann/json.hpp>
 
 #include <array>
 #include <cmath>
 #include <cstring>
 #include <filesystem>
+#include <optional>
 #include <stdexcept>
+#include <vector>
 
 namespace polyizon {
+
+namespace {
+
+// Phase 20 gizmo geometry — see RenderGizmo()/PickGizmoAxis()/
+// UpdateGizmoDrag(). World-axis-aligned (never the entity's own rotation).
+constexpr std::array<glm::vec3, 3> kGizmoAxisDirections = {
+    glm::vec3(1.0f, 0.0f, 0.0f), glm::vec3(0.0f, 1.0f, 0.0f), glm::vec3(0.0f, 0.0f, 1.0f)
+};
+constexpr std::array<glm::vec4, 3> kGizmoAxisColors = {
+    glm::vec4(0.9f, 0.15f, 0.15f, 1.0f), glm::vec4(0.15f, 0.9f, 0.15f, 1.0f), glm::vec4(0.2f, 0.4f, 0.95f, 1.0f)
+};
+constexpr glm::vec4 kGizmoHighlightColor(1.0f, 0.9f, 0.15f, 1.0f); // the axis currently being dragged/hovered
+constexpr float kGizmoArrowLength = 1.0f;
+constexpr float kGizmoArrowHeadFraction = 0.85f; // where the head cross starts, along the shaft
+constexpr float kGizmoArrowHeadSize = 0.08f;
+constexpr float kGizmoRingRadius = 1.25f;
+constexpr int kGizmoRingSegments = 24;
+constexpr float kGizmoPickThresholdPixels = 10.0f;
+// Move: 3 axes * (1 shaft + 4 head lines) * 2 verts = 30. Rotate: 3 rings *
+// 24 segments * 2 verts = 144. Rounded well up for headroom.
+constexpr std::size_t kGizmoMaxVertices = 256;
+
+void AppendGizmoArrow(std::vector<Vertex3D>& out, const glm::vec3& origin, int axis) {
+    const glm::vec3 dir = kGizmoAxisDirections[axis];
+    const glm::vec3 tip = origin + dir * kGizmoArrowLength;
+    const glm::vec3 headBase = origin + dir * (kGizmoArrowLength * kGizmoArrowHeadFraction);
+
+    glm::vec3 perpA, perpB;
+    switch (axis) {
+        case 0: perpA = glm::vec3(0.0f, 1.0f, 0.0f); perpB = glm::vec3(0.0f, 0.0f, 1.0f); break;
+        case 1: perpA = glm::vec3(1.0f, 0.0f, 0.0f); perpB = glm::vec3(0.0f, 0.0f, 1.0f); break;
+        default: perpA = glm::vec3(1.0f, 0.0f, 0.0f); perpB = glm::vec3(0.0f, 1.0f, 0.0f); break;
+    }
+
+    const glm::vec3 zero(0.0f);
+    out.push_back({ origin, zero });
+    out.push_back({ tip, zero });
+    out.push_back({ tip, zero });
+    out.push_back({ headBase + perpA * kGizmoArrowHeadSize, zero });
+    out.push_back({ tip, zero });
+    out.push_back({ headBase - perpA * kGizmoArrowHeadSize, zero });
+    out.push_back({ tip, zero });
+    out.push_back({ headBase + perpB * kGizmoArrowHeadSize, zero });
+    out.push_back({ tip, zero });
+    out.push_back({ headBase - perpB * kGizmoArrowHeadSize, zero });
+}
+
+// Ring for axis N lies in the plane perpendicular to N (standard rotation-
+// gizmo convention: rotating around X moves points within the YZ plane).
+void AppendGizmoRing(std::vector<Vertex3D>& out, const glm::vec3& origin, int axis) {
+    const glm::vec3 zero(0.0f);
+    for (int i = 0; i < kGizmoRingSegments; ++i) {
+        const float a0 = (2.0f * glm::pi<float>() * static_cast<float>(i)) / static_cast<float>(kGizmoRingSegments);
+        const float a1 = (2.0f * glm::pi<float>() * static_cast<float>(i + 1)) / static_cast<float>(kGizmoRingSegments);
+        const float c0 = std::cos(a0) * kGizmoRingRadius, s0 = std::sin(a0) * kGizmoRingRadius;
+        const float c1 = std::cos(a1) * kGizmoRingRadius, s1 = std::sin(a1) * kGizmoRingRadius;
+
+        glm::vec3 p0, p1;
+        switch (axis) {
+            case 0: p0 = origin + glm::vec3(0.0f, c0, s0); p1 = origin + glm::vec3(0.0f, c1, s1); break;
+            case 1: p0 = origin + glm::vec3(c0, 0.0f, s0); p1 = origin + glm::vec3(c1, 0.0f, s1); break;
+            default: p0 = origin + glm::vec3(c0, s0, 0.0f); p1 = origin + glm::vec3(c1, s1, 0.0f); break;
+        }
+        out.push_back({ p0, zero });
+        out.push_back({ p1, zero });
+    }
+}
+
+// Returns std::nullopt if worldPos projects behind the camera (w <= 0) —
+// callers (PickGizmoAxis/UpdateGizmoDrag) just skip that sample rather than
+// dividing by a near-zero/negative w.
+std::optional<glm::vec2> ProjectToScreen(const glm::mat4& viewProj, const glm::vec3& worldPos, VkExtent2D extent) {
+    const glm::vec4 clip = viewProj * glm::vec4(worldPos, 1.0f);
+    if (clip.w <= 0.0001f) {
+        return std::nullopt;
+    }
+    const glm::vec3 ndc = glm::vec3(clip) / clip.w;
+    return glm::vec2(
+        (ndc.x * 0.5f + 0.5f) * static_cast<float>(extent.width),
+        (ndc.y * 0.5f + 0.5f) * static_cast<float>(extent.height));
+}
+
+} // namespace
 
 EditorViewportRenderer::EditorViewportRenderer(HWND hwnd, HINSTANCE hinstance, std::uint32_t width, std::uint32_t height) {
     m_VulkanContext = std::make_unique<VulkanContext>(hwnd, hinstance, "Polyizon Editor");
@@ -27,6 +118,16 @@ EditorViewportRenderer::EditorViewportRenderer(HWND hwnd, HINSTANCE hinstance, s
     m_VoxelLitPipeline = std::make_unique<VoxelLitPipeline>(
         m_VulkanContext->GetDevice(), m_Swapchain->GetImageFormat(), m_Swapchain->GetDepthFormat());
     m_ShadowPipeline = std::make_unique<ShadowPipeline>(m_VulkanContext->GetDevice(), m_Swapchain->GetDepthFormat());
+    m_GizmoPipeline = std::make_unique<GizmoPipeline>(
+        m_VulkanContext->GetDevice(), m_Swapchain->GetImageFormat(), m_Swapchain->GetDepthFormat());
+
+    // Host-visible, rebuilt+re-uploaded every RenderGizmo() call (see its doc
+    // comment) — same per-frame-in-flight pattern as the UBO buffers below,
+    // just holding vertex data instead.
+    for (std::uint32_t i = 0; i < kMaxFramesInFlight; ++i) {
+        m_GizmoVertexBuffers[i] = std::make_unique<Buffer>(
+            m_VulkanContext->GetAllocator(), sizeof(Vertex3D) * kGizmoMaxVertices, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT);
+    }
 
     const CloudNoiseParams cloudNoiseParams{}; // same defaults as Application; not yet developer-editable here either
     const std::vector<std::uint8_t> cloudNoiseData = LoadOrGenerateCloudNoiseVolume(cloudNoiseParams);
@@ -69,7 +170,36 @@ void EditorViewportRenderer::LoadScene(const std::filesystem::path& sceneFile) {
     // GPU resources referenced by in-flight work" reasoning as the
     // destructor above.
     vkDeviceWaitIdle(m_VulkanContext->GetDevice());
-    m_Scene = ::LoadScene(*m_VulkanContext, sceneFile);
+    m_Scene = polyizon::LoadScene(*m_VulkanContext, sceneFile);
+    // A different scene entirely just replaced m_Scene — any in-progress
+    // Play snapshot belonged to the old one and no longer means anything.
+    m_PlayState = PlayState::Stopped;
+    m_PlaySnapshot.reset();
+}
+
+void EditorViewportRenderer::Play() {
+    if (m_PlayState == PlayState::Stopped) {
+        m_PlaySnapshot = std::make_unique<nlohmann::json>(SerializeSceneToJson(m_Scene));
+    }
+    m_PlayState = PlayState::Playing;
+}
+
+void EditorViewportRenderer::Pause() {
+    if (m_PlayState == PlayState::Playing) {
+        m_PlayState = PlayState::Paused;
+    }
+}
+
+void EditorViewportRenderer::Stop() {
+    if (m_PlayState == PlayState::Stopped || !m_PlaySnapshot) {
+        return;
+    }
+    // Same "GPU must be done with the scene's Mesh buffers before it's
+    // replaced" precedent as LoadScene() above.
+    vkDeviceWaitIdle(m_VulkanContext->GetDevice());
+    m_Scene = DeserializeSceneFromJson(*m_VulkanContext, *m_PlaySnapshot);
+    m_PlaySnapshot.reset();
+    m_PlayState = PlayState::Stopped;
 }
 
 void EditorViewportRenderer::Resize(std::uint32_t width, std::uint32_t height) {
@@ -383,6 +513,43 @@ void EditorViewportRenderer::UpdateLitUniformBuffer(std::uint32_t frameIndex, Vk
     ubo.lightSpaceMatrix = GetLightSpaceMatrix();
     ubo.sunDirectionAndAmbient = glm::vec4(GetSunDirection(), m_Scene.GetLightingSettings().ambientStrength);
 
+    // Phase 19: point/spot lights, capped at kMaxPointLights/kMaxSpotLights
+    // (see lit_uniform_buffer_object.hpp) — any beyond the cap are silently
+    // skipped rather than erroring, same precedent as other fixed-size-array
+    // limits in this engine.
+    entt::registry& registry = m_Scene.GetRegistry();
+
+    int pointCount = 0;
+    auto pointView = registry.view<const TransformComponent, const PointLightComponent>();
+    for (const entt::entity entity : pointView) {
+        if (pointCount >= kMaxPointLights) {
+            break;
+        }
+        const auto& transform = pointView.get<const TransformComponent>(entity);
+        const auto& light = pointView.get<const PointLightComponent>(entity);
+        ubo.pointLightPositionAndRange[pointCount] = glm::vec4(transform.position, light.range);
+        ubo.pointLightColorAndIntensity[pointCount] = glm::vec4(light.color, light.intensity);
+        ++pointCount;
+    }
+
+    int spotCount = 0;
+    auto spotView = registry.view<const TransformComponent, const SpotLightComponent>();
+    for (const entt::entity entity : spotView) {
+        if (spotCount >= kMaxSpotLights) {
+            break;
+        }
+        const auto& transform = spotView.get<const TransformComponent>(entity);
+        const auto& light = spotView.get<const SpotLightComponent>(entity);
+        ubo.spotLightPositionAndRange[spotCount] = glm::vec4(transform.position, light.range);
+        ubo.spotLightColorAndIntensity[spotCount] = glm::vec4(light.color, light.intensity);
+        ubo.spotLightDirectionAndInnerCos[spotCount] =
+            glm::vec4(transform.GetForward(), std::cos(glm::radians(light.innerConeDegrees)));
+        ubo.spotLightOuterCos[spotCount] = glm::vec4(std::cos(glm::radians(light.outerConeDegrees)), 0.0f, 0.0f, 0.0f);
+        ++spotCount;
+    }
+
+    ubo.lightCounts = glm::ivec4(pointCount, spotCount, 0, 0);
+
     m_LitUniformBuffers[frameIndex]->Upload(&ubo, sizeof(ubo));
 }
 
@@ -635,6 +802,8 @@ void EditorViewportRenderer::RenderMainPass(VkCommandBuffer cmd, VkImage colorIm
         DrawLitEntities(cmd, m_LitPipeline->GetLayout());
     }
 
+    RenderGizmo(cmd, extent);
+
     vkCmdEndRendering(cmd);
 
     VkImageMemoryBarrier2 toPresent = toColorAttachment;
@@ -681,6 +850,162 @@ void EditorViewportRenderer::DrawLitEntities(VkCommandBuffer cmd, VkPipelineLayo
     }
 }
 
+glm::mat4 EditorViewportRenderer::GetViewProjMatrix(VkExtent2D extent) const {
+    const float aspect = static_cast<float>(extent.width) / static_cast<float>(extent.height);
+    glm::mat4 proj = glm::perspective(glm::radians(45.0f), aspect, 0.1f, 50.0f);
+    proj[1][1] *= -1.0f;
+    return proj * m_Camera.GetViewMatrix();
+}
+
+void EditorViewportRenderer::RenderGizmo(VkCommandBuffer cmd, VkExtent2D extent) {
+    entt::registry& registry = m_Scene.GetRegistry();
+    if (m_SelectedEntity == entt::null || !registry.valid(m_SelectedEntity) ||
+        !registry.all_of<TransformComponent>(m_SelectedEntity)) {
+        return;
+    }
+    const auto& transform = registry.get<const TransformComponent>(m_SelectedEntity);
+
+    std::vector<Vertex3D> vertices;
+    vertices.reserve(kGizmoMaxVertices);
+    std::array<std::uint32_t, 3> firstVertex{};
+    std::array<std::uint32_t, 3> vertexCount{};
+    for (int axis = 0; axis < 3; ++axis) {
+        firstVertex[axis] = static_cast<std::uint32_t>(vertices.size());
+        if (m_GizmoMode == GizmoMode::Move) {
+            AppendGizmoArrow(vertices, transform.position, axis);
+        } else {
+            AppendGizmoRing(vertices, transform.position, axis);
+        }
+        vertexCount[axis] = static_cast<std::uint32_t>(vertices.size()) - firstVertex[axis];
+    }
+
+    m_GizmoVertexBuffers[m_CurrentFrame]->Upload(vertices.data(), sizeof(Vertex3D) * vertices.size());
+
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_GizmoPipeline->GetPipeline());
+    const VkBuffer vertexBuffer = m_GizmoVertexBuffers[m_CurrentFrame]->GetBuffer();
+    const VkDeviceSize offset = 0;
+    vkCmdBindVertexBuffers(cmd, 0, 1, &vertexBuffer, &offset);
+
+    const glm::mat4 viewProj = GetViewProjMatrix(extent);
+    // Plain float arrays rather than glm::mat4/vec4 directly, same convention
+    // as LitPushConstants (see lit_pipeline.hpp) — sidesteps any doubt about
+    // glm's struct layout matching the push_constant block's exactly.
+    struct GizmoPushConstants {
+        float mvp[16];
+        float color[4];
+    };
+    for (int axis = 0; axis < 3; ++axis) {
+        GizmoPushConstants pc{};
+        std::memcpy(pc.mvp, &viewProj, sizeof(pc.mvp)); // gizmo vertices are already baked in world space, so this is the whole transform
+        const glm::vec4& color = (axis == m_DraggingAxis) ? kGizmoHighlightColor : kGizmoAxisColors[axis];
+        pc.color[0] = color.r;
+        pc.color[1] = color.g;
+        pc.color[2] = color.b;
+        pc.color[3] = color.a;
+        vkCmdPushConstants(cmd, m_GizmoPipeline->GetLayout(),
+            VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(pc), &pc);
+        vkCmdDraw(cmd, vertexCount[axis], 1, firstVertex[axis], 0);
+    }
+}
+
+int EditorViewportRenderer::PickGizmoAxis(float mouseX, float mouseY) const {
+    const entt::registry& registry = m_Scene.GetRegistry();
+    if (m_SelectedEntity == entt::null || !registry.valid(m_SelectedEntity) ||
+        !registry.all_of<TransformComponent>(m_SelectedEntity)) {
+        return -1;
+    }
+    const auto& transform = registry.get<const TransformComponent>(m_SelectedEntity);
+    const VkExtent2D extent = m_Swapchain->GetExtent();
+    const glm::mat4 viewProj = GetViewProjMatrix(extent);
+
+    int bestAxis = -1;
+    float bestDistSq = kGizmoPickThresholdPixels * kGizmoPickThresholdPixels;
+    std::vector<Vertex3D> samples;
+    for (int axis = 0; axis < 3; ++axis) {
+        samples.clear();
+        if (m_GizmoMode == GizmoMode::Move) {
+            AppendGizmoArrow(samples, transform.position, axis);
+        } else {
+            AppendGizmoRing(samples, transform.position, axis);
+        }
+        for (const Vertex3D& vertex : samples) {
+            const std::optional<glm::vec2> screen = ProjectToScreen(viewProj, vertex.position, extent);
+            if (!screen) {
+                continue;
+            }
+            const float dx = screen->x - mouseX;
+            const float dy = screen->y - mouseY;
+            const float distSq = dx * dx + dy * dy;
+            if (distSq < bestDistSq) {
+                bestDistSq = distSq;
+                bestAxis = axis;
+            }
+        }
+    }
+    return bestAxis;
+}
+
+void EditorViewportRenderer::BeginGizmoDrag(int axis, float mouseX, float mouseY) {
+    m_DraggingAxis = axis;
+    m_LastDragMouseX = mouseX;
+    m_LastDragMouseY = mouseY;
+}
+
+void EditorViewportRenderer::UpdateGizmoDrag(float mouseX, float mouseY) {
+    entt::registry& registry = m_Scene.GetRegistry();
+    if (m_DraggingAxis < 0 || m_SelectedEntity == entt::null || !registry.valid(m_SelectedEntity) ||
+        !registry.all_of<TransformComponent>(m_SelectedEntity)) {
+        return;
+    }
+    auto& transform = registry.get<TransformComponent>(m_SelectedEntity);
+    const VkExtent2D extent = m_Swapchain->GetExtent();
+    const glm::mat4 viewProj = GetViewProjMatrix(extent);
+
+    const float prevMouseX = m_LastDragMouseX;
+    const float prevMouseY = m_LastDragMouseY;
+    m_LastDragMouseX = mouseX;
+    m_LastDragMouseY = mouseY;
+
+    const std::optional<glm::vec2> originScreen = ProjectToScreen(viewProj, transform.position, extent);
+    if (!originScreen) {
+        return;
+    }
+
+    if (m_GizmoMode == GizmoMode::Move) {
+        // Reprojected every call (not cached from BeginGizmoDrag) so a drag
+        // that moves the entity through a lot of perspective depth still
+        // tracks the mouse accurately at every step, not just at the start.
+        const std::optional<glm::vec2> tipScreen =
+            ProjectToScreen(viewProj, transform.position + kGizmoAxisDirections[m_DraggingAxis], extent);
+        if (!tipScreen) {
+            return;
+        }
+        const glm::vec2 axisScreenDelta = *tipScreen - *originScreen;
+        const float pixelsPerUnit = glm::length(axisScreenDelta);
+        if (pixelsPerUnit < 0.0001f) {
+            return; // axis is edge-on to the camera this frame - no reliable screen direction to project onto
+        }
+        const glm::vec2 axisScreenDir = axisScreenDelta / pixelsPerUnit;
+        const glm::vec2 mouseDelta(mouseX - prevMouseX, mouseY - prevMouseY);
+        const float moveAmount = glm::dot(mouseDelta, axisScreenDir) / pixelsPerUnit;
+        transform.position += kGizmoAxisDirections[m_DraggingAxis] * moveAmount;
+    } else {
+        const float prevAngle = std::atan2(prevMouseY - originScreen->y, prevMouseX - originScreen->x);
+        const float newAngle = std::atan2(mouseY - originScreen->y, mouseX - originScreen->x);
+        float deltaDegrees = glm::degrees(newAngle - prevAngle);
+        // Wrap to [-180, 180] so a crossing of atan2's +-180 seam doesn't
+        // spike the delta into a ~360-degree jump for one frame.
+        while (deltaDegrees > 180.0f) deltaDegrees -= 360.0f;
+        while (deltaDegrees < -180.0f) deltaDegrees += 360.0f;
+
+        switch (m_DraggingAxis) {
+            case 0: transform.rotationEulerDegrees.x += deltaDegrees; break;
+            case 1: transform.rotationEulerDegrees.y += deltaDegrees; break;
+            default: transform.rotationEulerDegrees.z += deltaDegrees; break;
+        }
+    }
+}
+
 void EditorViewportRenderer::RenderFrame() {
     VkDevice device = m_VulkanContext->GetDevice();
     VkFence inFlightFence = m_InFlightFences[m_CurrentFrame];
@@ -701,15 +1026,24 @@ void EditorViewportRenderer::RenderFrame() {
     // not a frame late. Uses the same deltaTime the camera was just updated
     // with (see UpdateCamera()), not a second independently-derived value.
     //
+    // Gated on PlayState::Playing (Phase 19) — Paused freezes scripts in
+    // place without discarding the frame's already-mutated state, and
+    // Stopped means scripts simply never run at all outside a Play session
+    // (see Play()/Pause()/Stop()). The camera above is updated unconditionally
+    // regardless of PlayState — it's an editor/dev-navigation concern, not
+    // part of the "game," so it keeps working in every state.
+    //
     // A Lua runtime error throws (see ScriptEngine::Update) — left uncaught
     // it would unwind straight out of MainWindow's QTimer lambda and crash
     // the editor. Routing it to Log instead (surfaced by the Console panel,
     // see editor/src/console_panel.hpp) means a broken script degrades
     // gracefully rather than taking the whole editor down with it.
-    try {
-        m_ScriptEngine.Update(m_Scene.GetRegistry(), m_LastDeltaTime);
-    } catch (const std::exception& e) {
-        Log::Error(e.what());
+    if (m_PlayState == PlayState::Playing) {
+        try {
+            m_ScriptEngine.Update(m_Scene.GetRegistry(), m_LastDeltaTime);
+        } catch (const std::exception& e) {
+            Log::Error(e.what());
+        }
     }
 
     const VkExtent2D extent = m_Swapchain->GetExtent();

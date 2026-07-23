@@ -1,13 +1,23 @@
 #include "content_browser_panel.hpp"
 
+#include <QFileDialog>
 #include <QFileInfo>
 #include <QFileSystemModel>
+#include <QMessageBox>
+#include <QPushButton>
+#include <QStringList>
 #include <QTreeView>
 #include <QVBoxLayout>
+
+#include <system_error>
 
 ContentBrowserPanel::ContentBrowserPanel(QWidget* parent) : QWidget(parent) {
     auto* layout = new QVBoxLayout(this);
     layout->setContentsMargins(4, 4, 4, 4);
+
+    auto* addFilesButton = new QPushButton("Add Files...", this);
+    connect(addFilesButton, &QPushButton::clicked, this, &ContentBrowserPanel::OnAddFiles);
+    layout->addWidget(addFilesButton);
 
     m_Model = new QFileSystemModel(this);
     // Root path is set later, once a project is opened (SetRootDirectory) —
@@ -39,4 +49,41 @@ void ContentBrowserPanel::OnDoubleClicked(const QModelIndex& index) {
     }
 
     emit SceneFileActivated(std::filesystem::path(info.absoluteFilePath().toStdWString()));
+}
+
+std::filesystem::path ContentBrowserPanel::GetImportTargetDirectory() const {
+    const QModelIndex current = m_TreeView->currentIndex();
+    if (current.isValid()) {
+        const QFileInfo info = m_Model->fileInfo(current);
+        const QString dirPath = info.isDir() ? info.absoluteFilePath() : info.absolutePath();
+        return std::filesystem::path(dirPath.toStdWString());
+    }
+    return std::filesystem::path(m_Model->rootPath().toStdWString());
+}
+
+void ContentBrowserPanel::OnAddFiles() {
+    const QStringList filePaths = QFileDialog::getOpenFileNames(this, "Add Files");
+    if (filePaths.isEmpty()) {
+        return; // user cancelled
+    }
+
+    const std::filesystem::path targetDir = GetImportTargetDirectory();
+
+    QStringList failed;
+    for (const QString& filePath : filePaths) {
+        const std::filesystem::path source(filePath.toStdWString());
+        const std::filesystem::path destination = targetDir / source.filename();
+
+        std::error_code copyError;
+        std::filesystem::copy_file(
+            source, destination, std::filesystem::copy_options::overwrite_existing, copyError);
+        if (copyError) {
+            failed.append(QString::fromStdWString(source.filename().native()));
+        }
+    }
+
+    if (!failed.isEmpty()) {
+        QMessageBox::critical(this, "Failed to import files",
+            "Could not copy the following file(s):\n" + failed.join("\n"));
+    }
 }

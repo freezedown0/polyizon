@@ -121,6 +121,19 @@ Application::Application(const ApplicationSpec& spec) {
 
     CreateFrameSyncObjects();
     InitImGui();
+
+    // Phase 20: project mode — see ApplicationSpec::projectDir's doc
+    // comment. Constructed last (needs the swapchain's color/depth formats,
+    // same ordering reasoning as m_SkyPipeline/m_Pipeline above), and only
+    // when a project was actually given; every member above is built
+    // unconditionally either way, so the hardcoded demo path is completely
+    // unaffected when this is unset.
+    if (spec.projectDir.has_value()) {
+        m_GameSceneRenderer = std::make_unique<GameSceneRenderer>(
+            *m_VulkanContext, m_Swapchain->GetImageFormat(), m_Swapchain->GetDepthFormat());
+        m_GameSceneRenderer->LoadProject(*spec.projectDir);
+        m_ProjectMode = true;
+    }
 }
 
 Application::~Application() {
@@ -146,7 +159,7 @@ void Application::Run() {
         m_Window->PollEvents();
         ProcessCameraKeyboardInput(deltaTime);
         OnUpdate(deltaTime);
-        RenderFrame();
+        RenderFrame(deltaTime);
     }
 }
 
@@ -494,7 +507,7 @@ void Application::UpdateSkyUniformBuffer(std::uint32_t frameIndex, VkExtent2D ex
     m_SkyUniformBuffers[frameIndex]->Upload(&sky, sizeof(sky));
 }
 
-void Application::RenderFrame() {
+void Application::RenderFrame(float deltaTime) {
     VkDevice device = m_VulkanContext->GetDevice();
     VkFence inFlightFence = m_InFlightFences[m_CurrentFrame];
 
@@ -514,6 +527,76 @@ void Application::RenderFrame() {
 
     const VkExtent2D extent = m_Swapchain->GetExtent();
     const float time = static_cast<float>(glfwGetTime());
+
+    VkCommandBuffer cmd = m_CommandBuffers[m_CurrentFrame];
+    vkResetCommandBuffer(cmd, 0);
+
+    VkCommandBufferBeginInfo beginInfo{};
+    beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+    beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    vkBeginCommandBuffer(cmd, &beginInfo);
+
+    if (m_ProjectMode) {
+        // Compiled-game path (Phase 20, see ApplicationSpec::projectDir):
+        // scripts always run (no Play/Pause/Stop distinction — a real game
+        // just runs) and GameSceneRenderer owns the entire shadow-pass/
+        // main-pass recording for this frame, including the swapchain
+        // image's layout transitions — nothing below this branch runs.
+        m_GameSceneRenderer->Update(deltaTime);
+
+        const float aspect = static_cast<float>(extent.width) / static_cast<float>(extent.height);
+        glm::mat4 proj = glm::perspective(glm::radians(45.0f), aspect, 0.1f, 50.0f);
+        proj[1][1] *= -1.0f; // Vulkan NDC is Y-down; glm::perspective assumes Y-up.
+
+        m_GameSceneRenderer->RecordFrame(cmd, m_Swapchain->GetImage(imageIndex), m_Swapchain->GetImageView(imageIndex),
+            m_Swapchain->GetDepthImage(), m_Swapchain->GetDepthImageView(), extent, m_CurrentFrame,
+            m_Camera.GetViewMatrix(), proj, time);
+
+        vkEndCommandBuffer(cmd);
+    } else {
+        RenderDemoFrame(cmd, imageIndex, extent, time);
+    }
+
+    VkSemaphore imageAvailable = m_ImageAvailableSemaphores[m_CurrentFrame];
+    VkSemaphore renderFinished = m_Swapchain->GetRenderFinishedSemaphore(imageIndex);
+
+    VkSemaphoreSubmitInfo waitInfo{};
+    waitInfo.sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO;
+    waitInfo.semaphore = imageAvailable;
+    waitInfo.stageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
+
+    VkSemaphoreSubmitInfo signalInfo{};
+    signalInfo.sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO;
+    signalInfo.semaphore = renderFinished;
+    signalInfo.stageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
+
+    VkCommandBufferSubmitInfo cmdSubmitInfo{};
+    cmdSubmitInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO;
+    cmdSubmitInfo.commandBuffer = cmd;
+
+    VkSubmitInfo2 submitInfo{};
+    submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO_2;
+    submitInfo.waitSemaphoreInfoCount = 1;
+    submitInfo.pWaitSemaphoreInfos = &waitInfo;
+    submitInfo.commandBufferInfoCount = 1;
+    submitInfo.pCommandBufferInfos = &cmdSubmitInfo;
+    submitInfo.signalSemaphoreInfoCount = 1;
+    submitInfo.pSignalSemaphoreInfos = &signalInfo;
+
+    if (vkQueueSubmit2(m_VulkanContext->GetGraphicsQueue(), 1, &submitInfo, inFlightFence) != VK_SUCCESS) {
+        throw std::runtime_error("Failed to submit frame command buffer");
+    }
+
+    m_Swapchain->Present(renderFinished, imageIndex);
+
+    m_CurrentFrame = (m_CurrentFrame + 1) % kMaxFramesInFlight;
+}
+
+// The original hardcoded quad/instancing/sky demo (unchanged from before
+// Phase 20) — records everything between vkBeginCommandBuffer and
+// vkEndCommandBuffer for the non-project-mode path. `cmd` is already begun
+// by the caller (RenderFrame()), which also ends it.
+void Application::RenderDemoFrame(VkCommandBuffer cmd, std::uint32_t imageIndex, VkExtent2D extent, float time) {
     UpdateUniformBuffer(m_CurrentFrame, extent);
     UpdateInstanceBuffer(m_CurrentFrame, time);
     UpdateSkyUniformBuffer(m_CurrentFrame, extent, time);
@@ -523,14 +606,6 @@ void Application::RenderFrame() {
     ImGui::NewFrame();
     BuildDebugOverlay();
     ImGui::Render();
-
-    VkCommandBuffer cmd = m_CommandBuffers[m_CurrentFrame];
-    vkResetCommandBuffer(cmd, 0);
-
-    VkCommandBufferBeginInfo beginInfo{};
-    beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
-    beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-    vkBeginCommandBuffer(cmd, &beginInfo);
 
     VkImage image = m_Swapchain->GetImage(imageIndex);
     const VkImageSubresourceRange range{ VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
@@ -661,40 +736,6 @@ void Application::RenderFrame() {
     vkCmdPipelineBarrier2(cmd, &toPresentDep);
 
     vkEndCommandBuffer(cmd);
-
-    VkSemaphore imageAvailable = m_ImageAvailableSemaphores[m_CurrentFrame];
-    VkSemaphore renderFinished = m_Swapchain->GetRenderFinishedSemaphore(imageIndex);
-
-    VkSemaphoreSubmitInfo waitInfo{};
-    waitInfo.sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO;
-    waitInfo.semaphore = imageAvailable;
-    waitInfo.stageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
-
-    VkSemaphoreSubmitInfo signalInfo{};
-    signalInfo.sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO;
-    signalInfo.semaphore = renderFinished;
-    signalInfo.stageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
-
-    VkCommandBufferSubmitInfo cmdSubmitInfo{};
-    cmdSubmitInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO;
-    cmdSubmitInfo.commandBuffer = cmd;
-
-    VkSubmitInfo2 submitInfo{};
-    submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO_2;
-    submitInfo.waitSemaphoreInfoCount = 1;
-    submitInfo.pWaitSemaphoreInfos = &waitInfo;
-    submitInfo.commandBufferInfoCount = 1;
-    submitInfo.pCommandBufferInfos = &cmdSubmitInfo;
-    submitInfo.signalSemaphoreInfoCount = 1;
-    submitInfo.pSignalSemaphoreInfos = &signalInfo;
-
-    if (vkQueueSubmit2(m_VulkanContext->GetGraphicsQueue(), 1, &submitInfo, inFlightFence) != VK_SUCCESS) {
-        throw std::runtime_error("Failed to submit frame command buffer");
-    }
-
-    m_Swapchain->Present(renderFinished, imageIndex);
-
-    m_CurrentFrame = (m_CurrentFrame + 1) % kMaxFramesInFlight;
 }
 
 void Application::InitImGui() {

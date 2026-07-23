@@ -12,6 +12,7 @@
 
 #include <QExposeEvent>
 #include <QKeyEvent>
+#include <QMessageBox>
 #include <QMouseEvent>
 #include <QResizeEvent>
 
@@ -52,6 +53,32 @@ void VulkanViewportWindow::LoadScene(const std::filesystem::path& sceneFile) {
         emit SceneLoaded();
     } else {
         m_PendingScenePath = sceneFile;
+    }
+}
+
+bool VulkanViewportWindow::MaybeWarnEditDuringPlay(QWidget* dialogParent) {
+    if (!m_Renderer || m_Renderer->GetPlayState() == polyizon::PlayState::Stopped) {
+        return false;
+    }
+    if (!m_EditWarningShown) {
+        m_EditWarningShown = true;
+        QMessageBox::information(dialogParent, "Editing during Play",
+            "You're editing the scene while Play/Pause is active.\n\n"
+            "These changes will be discarded when you press Stop — the scene "
+            "reverts to how it looked right before you pressed Play.");
+    }
+    return true;
+}
+
+void VulkanViewportWindow::SetSelectedEntity(entt::entity entity) {
+    if (m_Renderer) {
+        m_Renderer->SetSelectedEntity(entity);
+    }
+}
+
+void VulkanViewportWindow::SetGizmoMode(polyizon::GizmoMode mode) {
+    if (m_Renderer) {
+        m_Renderer->SetGizmoMode(mode);
     }
 }
 
@@ -108,16 +135,35 @@ void VulkanViewportWindow::mousePressEvent(QMouseEvent* event) {
     if (event->button() == Qt::RightButton) {
         m_MouseCaptured = true;
         m_LastMousePos = event->position();
+        return;
+    }
+    // Left-click: try picking a gizmo handle first (see PickGizmoAxis) —
+    // left button is otherwise completely unclaimed on this viewport (camera
+    // look is right-button-drag only), so this can't collide with anything.
+    if (event->button() == Qt::LeftButton && m_Renderer) {
+        const QPointF pos = event->position();
+        const int axis = m_Renderer->PickGizmoAxis(static_cast<float>(pos.x()), static_cast<float>(pos.y()));
+        if (axis >= 0) {
+            m_Renderer->BeginGizmoDrag(axis, static_cast<float>(pos.x()), static_cast<float>(pos.y()));
+        }
     }
 }
 
 void VulkanViewportWindow::mouseReleaseEvent(QMouseEvent* event) {
     if (event->button() == Qt::RightButton) {
         m_MouseCaptured = false;
+    } else if (event->button() == Qt::LeftButton && m_Renderer) {
+        m_Renderer->EndGizmoDrag();
     }
 }
 
 void VulkanViewportWindow::mouseMoveEvent(QMouseEvent* event) {
+    if (m_Renderer && m_Renderer->IsDraggingGizmo()) {
+        const QPointF pos = event->position();
+        m_Renderer->UpdateGizmoDrag(static_cast<float>(pos.x()), static_cast<float>(pos.y()));
+        return;
+    }
+
     if (!m_MouseCaptured || !m_Renderer) {
         return;
     }

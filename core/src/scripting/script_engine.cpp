@@ -1,4 +1,4 @@
-#include "script_engine.hpp"
+#include "polyizon/scripting/script_engine.hpp"
 
 #include "polyizon/log.hpp"
 
@@ -9,6 +9,8 @@
 
 #include <filesystem>
 #include <stdexcept>
+
+namespace polyizon {
 
 namespace {
 
@@ -38,17 +40,17 @@ ScriptEngine::ScriptEngine() {
         "y", &glm::vec3::y,
         "z", &glm::vec3::z);
 
-    m_Lua.new_usertype<polyizon::TransformComponent>("Transform",
-        "position", &polyizon::TransformComponent::position,
-        "rotationEulerDegrees", &polyizon::TransformComponent::rotationEulerDegrees,
-        "scale", &polyizon::TransformComponent::scale);
+    m_Lua.new_usertype<TransformComponent>("Transform",
+        "position", &TransformComponent::position,
+        "rotationEulerDegrees", &TransformComponent::rotationEulerDegrees,
+        "scale", &TransformComponent::scale);
 }
 
 void ScriptEngine::Update(entt::registry& registry, float deltaTime) {
-    auto view = registry.view<polyizon::TransformComponent, polyizon::ScriptComponent>();
+    auto view = registry.view<TransformComponent, ScriptComponent>();
     for (auto entity : view) {
         const auto& [transform, scriptComponent] =
-            view.get<polyizon::TransformComponent, polyizon::ScriptComponent>(entity);
+            view.get<TransformComponent, ScriptComponent>(entity);
         if (scriptComponent.scriptPath.empty()) {
             continue;
         }
@@ -111,10 +113,12 @@ ScriptEngine::LoadedScript& ScriptEngine::GetOrLoadScript(const std::string& scr
             // `!script.onUpdate.valid()` check already skips those) makes a
             // broken script a one-time cost instead.
             const sol::error err = loadResult;
-            polyizon::Log::Error("Failed to load script '" + resolvedPath.string() + "': " + err.what());
+            Log::Error("Failed to load script '" + resolvedPath.string() + "': " + err.what());
         }
     }
 
     const auto [inserted, wasInserted] = m_LoadedScripts.emplace(scriptPath, std::move(loaded));
     return inserted->second;
 }
+
+} // namespace polyizon

@@ -1,10 +1,10 @@
 #include "inspector_panel.hpp"
 
-#include "mesh_import.hpp"
 #include "vulkan_viewport_window.hpp"
 
 #include "editor_viewport_renderer.hpp"
 
+#include "polyizon/assets/mesh_import.hpp"
 #include "polyizon/scene/components.hpp"
 #include "polyizon/vulkan/context.hpp"
 
@@ -20,6 +20,7 @@
 #include <QLineEdit>
 #include <QMessageBox>
 #include <QPushButton>
+#include <QTimer>
 #include <QVBoxLayout>
 
 #include <filesystem>
@@ -64,8 +65,14 @@ void ClearLayout(QLayout* layout) {
         if (QWidget* widget = item->widget()) {
             widget->deleteLater();
         } else if (QLayout* childLayout = item->layout()) {
+            // QLayout derives from QLayoutItem, so for a nested-layout item
+            // `item` and `childLayout` are the SAME object (takeAt() returns
+            // the QLayout itself, upcast — unlike a widget row, which is
+            // wrapped in a distinct QWidgetItem). Deleting it here AND via
+            // `delete item` below would double-free it; clearing its
+            // children and falling through to the single `delete item` at
+            // the end is the correct, complete cleanup for this branch.
             ClearLayout(childLayout);
-            delete childLayout;
         }
         delete item;
     }
@@ -111,6 +118,8 @@ void InspectorPanel::Rebuild() {
     BuildMaterialSection(m_RootLayout, registry);
     BuildMeshSection(m_RootLayout, registry);
     BuildScriptSection(m_RootLayout, registry);
+    BuildPointLightSection(m_RootLayout, registry);
+    BuildSpotLightSection(m_RootLayout, registry);
 
     m_RootLayout->addStretch();
 }
@@ -124,6 +133,7 @@ void InspectorPanel::BuildTagSection(QFormLayout* form, entt::registry& registry
         if (!renderer || !renderer->GetScene().GetRegistry().valid(m_SelectedEntity)) {
             return;
         }
+        m_ViewportWindow->MaybeWarnEditDuringPlay(this);
         renderer->GetScene().GetRegistry().get<polyizon::TagComponent>(m_SelectedEntity).name =
             nameEdit->text().toStdString();
     });
@@ -148,6 +158,7 @@ void InspectorPanel::BuildTransformSection(QFormLayout* form, entt::registry& re
                     if (!renderer || !renderer->GetScene().GetRegistry().valid(m_SelectedEntity)) {
                         return;
                     }
+                    m_ViewportWindow->MaybeWarnEditDuringPlay(this);
                     auto& liveTransform = renderer->GetScene().GetRegistry().get<polyizon::TransformComponent>(m_SelectedEntity);
                     (liveTransform.*field)[axis] = static_cast<float>(value);
                 });
@@ -183,6 +194,7 @@ void InspectorPanel::BuildMaterialSection(QVBoxLayout* container, entt::registry
             if (!liveMaterial) {
                 return;
             }
+            m_ViewportWindow->MaybeWarnEditDuringPlay(this);
             const QColor existing(
                 static_cast<int>(liveMaterial->baseColor.r * 255.0f),
                 static_cast<int>(liveMaterial->baseColor.g * 255.0f),
@@ -202,8 +214,9 @@ void InspectorPanel::BuildMaterialSection(QVBoxLayout* container, entt::registry
             if (!renderer || !renderer->GetScene().GetRegistry().valid(m_SelectedEntity)) {
                 return;
             }
+            m_ViewportWindow->MaybeWarnEditDuringPlay(this);
             renderer->GetScene().GetRegistry().remove<polyizon::MaterialComponent>(m_SelectedEntity);
-            Rebuild();
+            QTimer::singleShot(0, this, &InspectorPanel::Rebuild);
         });
         rowLayout->addWidget(removeButton);
         container->addLayout(rowLayout);
@@ -214,8 +227,9 @@ void InspectorPanel::BuildMaterialSection(QVBoxLayout* container, entt::registry
             if (!renderer || !renderer->GetScene().GetRegistry().valid(m_SelectedEntity)) {
                 return;
             }
+            m_ViewportWindow->MaybeWarnEditDuringPlay(this);
             renderer->GetScene().GetRegistry().emplace<polyizon::MaterialComponent>(m_SelectedEntity);
-            Rebuild();
+            QTimer::singleShot(0, this, &InspectorPanel::Rebuild);
         });
         container->addWidget(addButton);
     }
@@ -241,6 +255,7 @@ void InspectorPanel::BuildMeshSection(QVBoxLayout* container, entt::registry& re
             if (!renderer || !renderer->GetScene().GetRegistry().valid(m_SelectedEntity)) {
                 return;
             }
+            m_ViewportWindow->MaybeWarnEditDuringPlay(this);
             try {
                 const std::filesystem::path chosen(filePath.toStdWString());
                 std::shared_ptr<polyizon::Mesh> newMesh = LoadMesh(renderer->GetVulkanContext(), chosen);
@@ -254,7 +269,7 @@ void InspectorPanel::BuildMeshSection(QVBoxLayout* container, entt::registry& re
                 QMessageBox::critical(this, "Failed to load mesh", e.what());
                 return;
             }
-            Rebuild();
+            QTimer::singleShot(0, this, &InspectorPanel::Rebuild);
         });
         rowLayout->addWidget(changeButton);
 
@@ -264,9 +279,10 @@ void InspectorPanel::BuildMeshSection(QVBoxLayout* container, entt::registry& re
             if (!renderer || !renderer->GetScene().GetRegistry().valid(m_SelectedEntity)) {
                 return;
             }
+            m_ViewportWindow->MaybeWarnEditDuringPlay(this);
             vkDeviceWaitIdle(renderer->GetVulkanContext().GetDevice());
             renderer->GetScene().GetRegistry().remove<polyizon::MeshComponent>(m_SelectedEntity);
-            Rebuild();
+            QTimer::singleShot(0, this, &InspectorPanel::Rebuild);
         });
         rowLayout->addWidget(removeButton);
         container->addLayout(rowLayout);
@@ -282,6 +298,7 @@ void InspectorPanel::BuildMeshSection(QVBoxLayout* container, entt::registry& re
             if (!renderer || !renderer->GetScene().GetRegistry().valid(m_SelectedEntity)) {
                 return;
             }
+            m_ViewportWindow->MaybeWarnEditDuringPlay(this);
             try {
                 const std::filesystem::path chosen(filePath.toStdWString());
                 std::shared_ptr<polyizon::Mesh> newMesh = LoadMesh(renderer->GetVulkanContext(), chosen);
@@ -291,7 +308,7 @@ void InspectorPanel::BuildMeshSection(QVBoxLayout* container, entt::registry& re
                 QMessageBox::critical(this, "Failed to load mesh", e.what());
                 return;
             }
-            Rebuild();
+            QTimer::singleShot(0, this, &InspectorPanel::Rebuild);
         });
         container->addWidget(addButton);
     }
@@ -307,6 +324,7 @@ void InspectorPanel::BuildScriptSection(QVBoxLayout* container, entt::registry& 
             if (!renderer || !renderer->GetScene().GetRegistry().valid(m_SelectedEntity)) {
                 return;
             }
+            m_ViewportWindow->MaybeWarnEditDuringPlay(this);
             renderer->GetScene().GetRegistry().get<polyizon::ScriptComponent>(m_SelectedEntity).scriptPath =
                 pathEdit->text().toStdString();
         });
@@ -326,6 +344,7 @@ void InspectorPanel::BuildScriptSection(QVBoxLayout* container, entt::registry& 
             if (!renderer || !renderer->GetScene().GetRegistry().valid(m_SelectedEntity)) {
                 return;
             }
+            m_ViewportWindow->MaybeWarnEditDuringPlay(this);
             renderer->GetScene().GetRegistry().get<polyizon::ScriptComponent>(m_SelectedEntity).scriptPath = stored;
         });
         rowLayout->addWidget(browseButton);
@@ -336,8 +355,9 @@ void InspectorPanel::BuildScriptSection(QVBoxLayout* container, entt::registry& 
             if (!renderer || !renderer->GetScene().GetRegistry().valid(m_SelectedEntity)) {
                 return;
             }
+            m_ViewportWindow->MaybeWarnEditDuringPlay(this);
             renderer->GetScene().GetRegistry().remove<polyizon::ScriptComponent>(m_SelectedEntity);
-            Rebuild();
+            QTimer::singleShot(0, this, &InspectorPanel::Rebuild);
         });
         rowLayout->addWidget(removeButton);
         container->addLayout(rowLayout);
@@ -354,8 +374,233 @@ void InspectorPanel::BuildScriptSection(QVBoxLayout* container, entt::registry& 
                 return;
             }
             const std::string stored = ToStoredAssetPath(std::filesystem::path(filePath.toStdWString()));
+            m_ViewportWindow->MaybeWarnEditDuringPlay(this);
             renderer->GetScene().GetRegistry().emplace<polyizon::ScriptComponent>(m_SelectedEntity, stored);
-            Rebuild();
+            QTimer::singleShot(0, this, &InspectorPanel::Rebuild);
+        });
+        container->addWidget(addButton);
+    }
+}
+
+void InspectorPanel::BuildPointLightSection(QVBoxLayout* container, entt::registry& registry) {
+    container->addWidget(new QLabel("<b>Point Light</b>", this));
+
+    if (auto* light = registry.try_get<polyizon::PointLightComponent>(m_SelectedEntity)) {
+        auto* form = new QFormLayout();
+
+        const QColor current(
+            static_cast<int>(light->color.r * 255.0f),
+            static_cast<int>(light->color.g * 255.0f),
+            static_cast<int>(light->color.b * 255.0f));
+        auto* colorButton = new QPushButton(this);
+        colorButton->setFixedWidth(48);
+        colorButton->setStyleSheet(QString("background-color: %1;").arg(current.name()));
+        connect(colorButton, &QPushButton::clicked, this, [this, colorButton]() {
+            polyizon::EditorViewportRenderer* renderer = m_ViewportWindow->GetRenderer();
+            if (!renderer || !renderer->GetScene().GetRegistry().valid(m_SelectedEntity)) {
+                return;
+            }
+            auto* liveLight = renderer->GetScene().GetRegistry().try_get<polyizon::PointLightComponent>(m_SelectedEntity);
+            if (!liveLight) {
+                return;
+            }
+            m_ViewportWindow->MaybeWarnEditDuringPlay(this);
+            const QColor existing(
+                static_cast<int>(liveLight->color.r * 255.0f),
+                static_cast<int>(liveLight->color.g * 255.0f),
+                static_cast<int>(liveLight->color.b * 255.0f));
+            const QColor chosen = QColorDialog::getColor(existing, this, "Light Color");
+            if (!chosen.isValid()) {
+                return;
+            }
+            liveLight->color = glm::vec3(chosen.redF(), chosen.greenF(), chosen.blueF());
+            colorButton->setStyleSheet(QString("background-color: %1;").arg(chosen.name()));
+        });
+        form->addRow("Color", colorButton);
+
+        auto* intensitySpin = new QDoubleSpinBox(this);
+        intensitySpin->setRange(0.0, 1000.0);
+        intensitySpin->setDecimals(2);
+        intensitySpin->setSingleStep(0.1);
+        intensitySpin->setValue(light->intensity);
+        connect(intensitySpin, qOverload<double>(&QDoubleSpinBox::valueChanged), this, [this](double value) {
+            polyizon::EditorViewportRenderer* renderer = m_ViewportWindow->GetRenderer();
+            if (!renderer || !renderer->GetScene().GetRegistry().valid(m_SelectedEntity)) {
+                return;
+            }
+            m_ViewportWindow->MaybeWarnEditDuringPlay(this);
+            renderer->GetScene().GetRegistry().get<polyizon::PointLightComponent>(m_SelectedEntity).intensity =
+                static_cast<float>(value);
+        });
+        form->addRow("Intensity", intensitySpin);
+
+        auto* rangeSpin = new QDoubleSpinBox(this);
+        rangeSpin->setRange(0.1, 1000.0);
+        rangeSpin->setDecimals(2);
+        rangeSpin->setSingleStep(0.5);
+        rangeSpin->setValue(light->range);
+        connect(rangeSpin, qOverload<double>(&QDoubleSpinBox::valueChanged), this, [this](double value) {
+            polyizon::EditorViewportRenderer* renderer = m_ViewportWindow->GetRenderer();
+            if (!renderer || !renderer->GetScene().GetRegistry().valid(m_SelectedEntity)) {
+                return;
+            }
+            m_ViewportWindow->MaybeWarnEditDuringPlay(this);
+            renderer->GetScene().GetRegistry().get<polyizon::PointLightComponent>(m_SelectedEntity).range =
+                static_cast<float>(value);
+        });
+        form->addRow("Range", rangeSpin);
+
+        container->addLayout(form);
+
+        auto* removeButton = new QPushButton("Remove Point Light", this);
+        connect(removeButton, &QPushButton::clicked, this, [this]() {
+            polyizon::EditorViewportRenderer* renderer = m_ViewportWindow->GetRenderer();
+            if (!renderer || !renderer->GetScene().GetRegistry().valid(m_SelectedEntity)) {
+                return;
+            }
+            m_ViewportWindow->MaybeWarnEditDuringPlay(this);
+            renderer->GetScene().GetRegistry().remove<polyizon::PointLightComponent>(m_SelectedEntity);
+            QTimer::singleShot(0, this, &InspectorPanel::Rebuild);
+        });
+        container->addWidget(removeButton);
+    } else {
+        auto* addButton = new QPushButton("Add Point Light", this);
+        connect(addButton, &QPushButton::clicked, this, [this]() {
+            polyizon::EditorViewportRenderer* renderer = m_ViewportWindow->GetRenderer();
+            if (!renderer || !renderer->GetScene().GetRegistry().valid(m_SelectedEntity)) {
+                return;
+            }
+            m_ViewportWindow->MaybeWarnEditDuringPlay(this);
+            renderer->GetScene().GetRegistry().emplace<polyizon::PointLightComponent>(m_SelectedEntity);
+            QTimer::singleShot(0, this, &InspectorPanel::Rebuild);
+        });
+        container->addWidget(addButton);
+    }
+}
+
+void InspectorPanel::BuildSpotLightSection(QVBoxLayout* container, entt::registry& registry) {
+    container->addWidget(new QLabel("<b>Spot Light</b>", this));
+
+    if (auto* light = registry.try_get<polyizon::SpotLightComponent>(m_SelectedEntity)) {
+        auto* form = new QFormLayout();
+
+        const QColor current(
+            static_cast<int>(light->color.r * 255.0f),
+            static_cast<int>(light->color.g * 255.0f),
+            static_cast<int>(light->color.b * 255.0f));
+        auto* colorButton = new QPushButton(this);
+        colorButton->setFixedWidth(48);
+        colorButton->setStyleSheet(QString("background-color: %1;").arg(current.name()));
+        connect(colorButton, &QPushButton::clicked, this, [this, colorButton]() {
+            polyizon::EditorViewportRenderer* renderer = m_ViewportWindow->GetRenderer();
+            if (!renderer || !renderer->GetScene().GetRegistry().valid(m_SelectedEntity)) {
+                return;
+            }
+            auto* liveLight = renderer->GetScene().GetRegistry().try_get<polyizon::SpotLightComponent>(m_SelectedEntity);
+            if (!liveLight) {
+                return;
+            }
+            m_ViewportWindow->MaybeWarnEditDuringPlay(this);
+            const QColor existing(
+                static_cast<int>(liveLight->color.r * 255.0f),
+                static_cast<int>(liveLight->color.g * 255.0f),
+                static_cast<int>(liveLight->color.b * 255.0f));
+            const QColor chosen = QColorDialog::getColor(existing, this, "Light Color");
+            if (!chosen.isValid()) {
+                return;
+            }
+            liveLight->color = glm::vec3(chosen.redF(), chosen.greenF(), chosen.blueF());
+            colorButton->setStyleSheet(QString("background-color: %1;").arg(chosen.name()));
+        });
+        form->addRow("Color", colorButton);
+
+        auto* intensitySpin = new QDoubleSpinBox(this);
+        intensitySpin->setRange(0.0, 1000.0);
+        intensitySpin->setDecimals(2);
+        intensitySpin->setSingleStep(0.1);
+        intensitySpin->setValue(light->intensity);
+        connect(intensitySpin, qOverload<double>(&QDoubleSpinBox::valueChanged), this, [this](double value) {
+            polyizon::EditorViewportRenderer* renderer = m_ViewportWindow->GetRenderer();
+            if (!renderer || !renderer->GetScene().GetRegistry().valid(m_SelectedEntity)) {
+                return;
+            }
+            m_ViewportWindow->MaybeWarnEditDuringPlay(this);
+            renderer->GetScene().GetRegistry().get<polyizon::SpotLightComponent>(m_SelectedEntity).intensity =
+                static_cast<float>(value);
+        });
+        form->addRow("Intensity", intensitySpin);
+
+        auto* rangeSpin = new QDoubleSpinBox(this);
+        rangeSpin->setRange(0.1, 1000.0);
+        rangeSpin->setDecimals(2);
+        rangeSpin->setSingleStep(0.5);
+        rangeSpin->setValue(light->range);
+        connect(rangeSpin, qOverload<double>(&QDoubleSpinBox::valueChanged), this, [this](double value) {
+            polyizon::EditorViewportRenderer* renderer = m_ViewportWindow->GetRenderer();
+            if (!renderer || !renderer->GetScene().GetRegistry().valid(m_SelectedEntity)) {
+                return;
+            }
+            m_ViewportWindow->MaybeWarnEditDuringPlay(this);
+            renderer->GetScene().GetRegistry().get<polyizon::SpotLightComponent>(m_SelectedEntity).range =
+                static_cast<float>(value);
+        });
+        form->addRow("Range", rangeSpin);
+
+        auto* innerConeSpin = new QDoubleSpinBox(this);
+        innerConeSpin->setRange(0.0, 90.0);
+        innerConeSpin->setDecimals(1);
+        innerConeSpin->setSingleStep(1.0);
+        innerConeSpin->setValue(light->innerConeDegrees);
+        connect(innerConeSpin, qOverload<double>(&QDoubleSpinBox::valueChanged), this, [this](double value) {
+            polyizon::EditorViewportRenderer* renderer = m_ViewportWindow->GetRenderer();
+            if (!renderer || !renderer->GetScene().GetRegistry().valid(m_SelectedEntity)) {
+                return;
+            }
+            m_ViewportWindow->MaybeWarnEditDuringPlay(this);
+            renderer->GetScene().GetRegistry().get<polyizon::SpotLightComponent>(m_SelectedEntity).innerConeDegrees =
+                static_cast<float>(value);
+        });
+        form->addRow("Inner Cone", innerConeSpin);
+
+        auto* outerConeSpin = new QDoubleSpinBox(this);
+        outerConeSpin->setRange(0.0, 90.0);
+        outerConeSpin->setDecimals(1);
+        outerConeSpin->setSingleStep(1.0);
+        outerConeSpin->setValue(light->outerConeDegrees);
+        connect(outerConeSpin, qOverload<double>(&QDoubleSpinBox::valueChanged), this, [this](double value) {
+            polyizon::EditorViewportRenderer* renderer = m_ViewportWindow->GetRenderer();
+            if (!renderer || !renderer->GetScene().GetRegistry().valid(m_SelectedEntity)) {
+                return;
+            }
+            m_ViewportWindow->MaybeWarnEditDuringPlay(this);
+            renderer->GetScene().GetRegistry().get<polyizon::SpotLightComponent>(m_SelectedEntity).outerConeDegrees =
+                static_cast<float>(value);
+        });
+        form->addRow("Outer Cone", outerConeSpin);
+
+        container->addLayout(form);
+
+        auto* removeButton = new QPushButton("Remove Spot Light", this);
+        connect(removeButton, &QPushButton::clicked, this, [this]() {
+            polyizon::EditorViewportRenderer* renderer = m_ViewportWindow->GetRenderer();
+            if (!renderer || !renderer->GetScene().GetRegistry().valid(m_SelectedEntity)) {
+                return;
+            }
+            m_ViewportWindow->MaybeWarnEditDuringPlay(this);
+            renderer->GetScene().GetRegistry().remove<polyizon::SpotLightComponent>(m_SelectedEntity);
+            QTimer::singleShot(0, this, &InspectorPanel::Rebuild);
+        });
+        container->addWidget(removeButton);
+    } else {
+        auto* addButton = new QPushButton("Add Spot Light", this);
+        connect(addButton, &QPushButton::clicked, this, [this]() {
+            polyizon::EditorViewportRenderer* renderer = m_ViewportWindow->GetRenderer();
+            if (!renderer || !renderer->GetScene().GetRegistry().valid(m_SelectedEntity)) {
+                return;
+            }
+            m_ViewportWindow->MaybeWarnEditDuringPlay(this);
+            renderer->GetScene().GetRegistry().emplace<polyizon::SpotLightComponent>(m_SelectedEntity);
+            QTimer::singleShot(0, this, &InspectorPanel::Rebuild);
         });
         container->addWidget(addButton);
     }

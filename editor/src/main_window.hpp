@@ -16,6 +16,7 @@ class ConsolePanel;
 class ContentBrowserPanel;
 class HierarchyPanel;
 class InspectorPanel;
+class LightingSettingsDialog;
 class VulkanViewportWindow;
 
 // Editor's top-level window: hosts VulkanViewportWindow as the central
@@ -31,7 +32,10 @@ class VulkanViewportWindow;
 // scene file within the same project, not just the project's default one.
 // Phase 18 adds a Lighting menu (Realistic/Voxel) that toggles the loaded
 // scene's SceneLightingSettings::mode directly — a live in-memory switch,
-// persisted only through the existing Save Scene action.
+// persisted only through the existing Save Scene action. Phase 19 adds a
+// Play menu/toolbar (Play/Pause/Stop, see EditorViewportRenderer::PlayState)
+// and a Lighting > Settings... dialog for the sun/ambient sliders that
+// SceneLightingSettings has always had but no UI could edit until now.
 class MainWindow : public QMainWindow {
     Q_OBJECT
 
@@ -42,6 +46,7 @@ private slots:
     void OnNewProject();
     void OnOpenProject();
     void OnSaveScene();
+    void OnBuildGame();
 
     // Connected to VulkanViewportWindow::SceneLoaded (same signal
     // HierarchyPanel::Refresh() is connected to) rather than called directly
@@ -49,6 +54,18 @@ private slots:
     // paint is applied later, deferred (see SceneLoaded's doc comment), and
     // this must run after either case, not just the synchronous one.
     void SyncLightingModeMenu();
+
+    // Play/Pause/Stop — see EditorViewportRenderer::Play()/Pause()/Stop() for
+    // the actual state machine; these just forward to it and keep the
+    // menu/toolbar actions' enabled state in sync (see
+    // UpdatePlayActionsEnabled()).
+    void OnPlay();
+    void OnPause();
+    void OnStop();
+
+    void OnOpenLightingSettings();
+
+    void OnCredits();
 
 private:
     // Shared by OnNewProject/OnOpenProject/ContentBrowserPanel's
@@ -62,6 +79,12 @@ private:
     // project/scene is loaded yet (renderer is null).
     void SetLightingMode(polyizon::LightingMode mode);
 
+    // Enabled state depends on both whether a scene is loaded at all (same
+    // gate as m_SaveSceneAction) and the renderer's current PlayState — e.g.
+    // Pause only makes sense while Playing. Called after every state
+    // transition (Play/Pause/Stop) and after a new scene loads.
+    void UpdatePlayActionsEnabled();
+
     VulkanViewportWindow* m_ViewportWindow = nullptr; // owned by its container widget, not directly by this
     QTimer* m_RenderTimer = nullptr; // owned by Qt's parent-child hierarchy (parented to this)
 
@@ -69,10 +92,19 @@ private:
     InspectorPanel* m_InspectorPanel = nullptr;
     ContentBrowserPanel* m_ContentBrowserPanel = nullptr;
     ConsolePanel* m_ConsolePanel = nullptr;
+    // Lazily constructed on first Lighting > Settings... click, parented to
+    // `this` (Qt's parent-child hierarchy owns/destroys it) — a modeless
+    // dialog (show(), never exec()) so the render timer keeps running and
+    // slider drags preview live in the viewport.
+    LightingSettingsDialog* m_LightingSettingsDialog = nullptr;
 
     QAction* m_SaveSceneAction = nullptr;
+    QAction* m_BuildGameAction = nullptr;
     QAction* m_RealisticLightingAction = nullptr;
     QAction* m_VoxelLightingAction = nullptr;
+    QAction* m_PlayAction = nullptr;
+    QAction* m_PauseAction = nullptr;
+    QAction* m_StopAction = nullptr;
 
     std::unique_ptr<Project> m_CurrentProject;
     // Distinct from m_CurrentProject->GetDefaultScenePath() — Content

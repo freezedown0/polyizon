@@ -6,11 +6,27 @@
 // smooth hardware-PCF sampler2DShadow tap — see
 // core/include/polyizon/vulkan/shadow_map.hpp's ShadowSamplerMode.
 
+// Must match kMaxPointLights/kMaxSpotLights in
+// core/include/polyizon/vulkan/lit_uniform_buffer_object.hpp exactly (see
+// that header's comment on why there's no shared C++/GLSL constant here).
+#define kMaxPointLights 4
+#define kMaxSpotLights 4
+
 layout(set = 0, binding = 0) uniform LitUniformBufferObject {
     mat4 view;
     mat4 proj;
     mat4 lightSpaceMatrix;
     vec4 sunDirectionAndAmbient;
+
+    vec4 pointLightPositionAndRange[kMaxPointLights];
+    vec4 pointLightColorAndIntensity[kMaxPointLights];
+
+    vec4 spotLightPositionAndRange[kMaxSpotLights];
+    vec4 spotLightColorAndIntensity[kMaxSpotLights];
+    vec4 spotLightDirectionAndInnerCos[kMaxSpotLights];
+    vec4 spotLightOuterCos[kMaxSpotLights];
+
+    ivec4 lightCounts; // x = active point count, y = active spot count
 } ubo;
 
 // Plain (non-comparison) sampler, NEAREST-filtered — reading the raw stored
@@ -26,6 +42,7 @@ layout(push_constant) uniform PushConstants {
 
 layout(location = 0) in vec3 vWorldNormal;
 layout(location = 1) in vec4 vLightSpacePos;
+layout(location = 2) in vec3 vWorldPos;
 
 layout(location = 0) out vec4 outColor;
 
@@ -57,6 +74,60 @@ float SampleVoxelShadow(vec4 lightSpacePos) {
     return fragSlice <= occluderSlice ? 1.0 : 0.0;
 }
 
+// Identical to lit.frag's function of the same name — see there for the
+// falloff/formula rationale. No voxel-specific quantization here: only the
+// sun's shadow is deliberately blocky, point/spot lights have no shadows in
+// either mode.
+vec3 ComputePointLightContribution(vec3 worldPos, vec3 normal) {
+    vec3 total = vec3(0.0);
+    for (int i = 0; i < ubo.lightCounts.x; ++i) {
+        vec3 lightPos = ubo.pointLightPositionAndRange[i].xyz;
+        float range = ubo.pointLightPositionAndRange[i].w;
+        vec3 toLight = lightPos - worldPos;
+        float dist = length(toLight);
+        if (dist >= range) {
+            continue;
+        }
+        vec3 lightDir = toLight / max(dist, 0.0001);
+        float ndotl = max(dot(normal, lightDir), 0.0);
+        float attenuation = clamp(1.0 - (dist / range), 0.0, 1.0);
+        attenuation *= attenuation;
+        vec3 color = ubo.pointLightColorAndIntensity[i].rgb;
+        float intensity = ubo.pointLightColorAndIntensity[i].a;
+        total += color * intensity * ndotl * attenuation;
+    }
+    return total;
+}
+
+vec3 ComputeSpotLightContribution(vec3 worldPos, vec3 normal) {
+    vec3 total = vec3(0.0);
+    for (int i = 0; i < ubo.lightCounts.y; ++i) {
+        vec3 lightPos = ubo.spotLightPositionAndRange[i].xyz;
+        float range = ubo.spotLightPositionAndRange[i].w;
+        vec3 toLight = lightPos - worldPos;
+        float dist = length(toLight);
+        if (dist >= range) {
+            continue;
+        }
+        vec3 lightDir = toLight / max(dist, 0.0001);
+        float ndotl = max(dot(normal, lightDir), 0.0);
+
+        vec3 spotDir = ubo.spotLightDirectionAndInnerCos[i].xyz;
+        float innerCos = ubo.spotLightDirectionAndInnerCos[i].w;
+        float outerCos = ubo.spotLightOuterCos[i].x;
+        float cosAngle = dot(-lightDir, spotDir);
+        float coneFactor = clamp((cosAngle - outerCos) / max(innerCos - outerCos, 0.0001), 0.0, 1.0);
+
+        float attenuation = clamp(1.0 - (dist / range), 0.0, 1.0);
+        attenuation *= attenuation;
+
+        vec3 color = ubo.spotLightColorAndIntensity[i].rgb;
+        float intensity = ubo.spotLightColorAndIntensity[i].a;
+        total += color * intensity * ndotl * attenuation * coneFactor;
+    }
+    return total;
+}
+
 void main() {
     vec3 normal = normalize(vWorldNormal);
     vec3 sunDir = ubo.sunDirectionAndAmbient.xyz;
@@ -66,5 +137,6 @@ void main() {
     float shadow = SampleVoxelShadow(vLightSpacePos);
 
     vec3 lit = pc.baseColor.rgb * (ambient + diffuse * shadow);
+    lit += pc.baseColor.rgb * (ComputePointLightContribution(vWorldPos, normal) + ComputeSpotLightContribution(vWorldPos, normal));
     outColor = vec4(lit, pc.baseColor.a);
 }

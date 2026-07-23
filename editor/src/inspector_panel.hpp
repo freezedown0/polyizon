@@ -25,8 +25,12 @@ class VulkanViewportWindow;
 // Deliberately does NOT poll the registry every frame to reflect
 // script-driven changes (e.g. spin.lua rotating a cube) live while
 // selected — doing so would fight the user's own in-progress edits in the
-// same fields. A future phase can add a "playing" vs. "editing" mode
-// distinction; this phase shows a snapshot as of selection time.
+// same fields. Phase 19 added the "playing" vs. "editing" mode distinction
+// this comment used to say was future work (see EditorViewportRenderer::
+// PlayState) — but this panel's own behavior here is unchanged: still a
+// snapshot as of selection time, editable at any PlayState (see
+// VulkanViewportWindow::MaybeWarnEditDuringPlay for the one-time heads-up
+// shown instead of blocking edits during Play/Pause).
 class InspectorPanel : public QWidget {
     Q_OBJECT
 
@@ -43,6 +47,8 @@ private:
     void BuildMaterialSection(QVBoxLayout* container, entt::registry& registry);
     void BuildMeshSection(QVBoxLayout* container, entt::registry& registry);
     void BuildScriptSection(QVBoxLayout* container, entt::registry& registry);
+    void BuildPointLightSection(QVBoxLayout* container, entt::registry& registry);
+    void BuildSpotLightSection(QVBoxLayout* container, entt::registry& registry);
 
     VulkanViewportWindow* m_ViewportWindow;
     entt::entity m_SelectedEntity = entt::null;

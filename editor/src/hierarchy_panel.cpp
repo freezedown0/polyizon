@@ -1,10 +1,10 @@
 #include "hierarchy_panel.hpp"
 
-#include "mesh_import.hpp"
 #include "vulkan_viewport_window.hpp"
 
 #include "editor_viewport_renderer.hpp"
 
+#include "polyizon/assets/mesh_import.hpp"
 #include "polyizon/scene/components.hpp"
 #include "polyizon/vulkan/context.hpp"
 
@@ -48,10 +48,14 @@ HierarchyPanel::HierarchyPanel(VulkanViewportWindow* viewportWindow, QWidget* pa
     auto* addEmptyButton = new QPushButton("Add Empty", this);
     auto* addCubeButton = new QPushButton("Add Cube", this);
     auto* addPlaneButton = new QPushButton("Add Plane", this);
+    auto* addPointLightButton = new QPushButton("Add Point Light", this);
+    auto* addSpotLightButton = new QPushButton("Add Spot Light", this);
     auto* deleteButton = new QPushButton("Delete Selected", this);
     toolbar->addWidget(addEmptyButton);
     toolbar->addWidget(addCubeButton);
     toolbar->addWidget(addPlaneButton);
+    toolbar->addWidget(addPointLightButton);
+    toolbar->addWidget(addSpotLightButton);
     toolbar->addWidget(deleteButton);
     layout->addLayout(toolbar);
 
@@ -61,6 +65,8 @@ HierarchyPanel::HierarchyPanel(VulkanViewportWindow* viewportWindow, QWidget* pa
     connect(addEmptyButton, &QPushButton::clicked, this, &HierarchyPanel::OnAddEmpty);
     connect(addCubeButton, &QPushButton::clicked, this, &HierarchyPanel::OnAddCube);
     connect(addPlaneButton, &QPushButton::clicked, this, &HierarchyPanel::OnAddPlane);
+    connect(addPointLightButton, &QPushButton::clicked, this, &HierarchyPanel::OnAddPointLight);
+    connect(addSpotLightButton, &QPushButton::clicked, this, &HierarchyPanel::OnAddSpotLight);
     connect(deleteButton, &QPushButton::clicked, this, &HierarchyPanel::OnDeleteSelected);
     connect(m_ListWidget, &QListWidget::itemSelectionChanged, this, &HierarchyPanel::OnSelectionChanged);
 }
@@ -88,6 +94,7 @@ void HierarchyPanel::OnAddEmpty() {
     if (!renderer) {
         return;
     }
+    m_ViewportWindow->MaybeWarnEditDuringPlay(this);
 
     polyizon::Scene& scene = renderer->GetScene();
     const entt::entity entity = scene.CreateEntity();
@@ -104,11 +111,42 @@ void HierarchyPanel::OnAddPlane() {
     AddMeshEntity("Plane", "models/plane.obj");
 }
 
+void HierarchyPanel::OnAddPointLight() {
+    polyizon::EditorViewportRenderer* renderer = m_ViewportWindow->GetRenderer();
+    if (!renderer) {
+        return;
+    }
+    m_ViewportWindow->MaybeWarnEditDuringPlay(this);
+
+    polyizon::Scene& scene = renderer->GetScene();
+    const entt::entity entity = scene.CreateEntity();
+    scene.GetRegistry().emplace<polyizon::TagComponent>(entity, "Point Light");
+    scene.GetRegistry().emplace<polyizon::TransformComponent>(entity);
+    scene.GetRegistry().emplace<polyizon::PointLightComponent>(entity);
+    Refresh();
+}
+
+void HierarchyPanel::OnAddSpotLight() {
+    polyizon::EditorViewportRenderer* renderer = m_ViewportWindow->GetRenderer();
+    if (!renderer) {
+        return;
+    }
+    m_ViewportWindow->MaybeWarnEditDuringPlay(this);
+
+    polyizon::Scene& scene = renderer->GetScene();
+    const entt::entity entity = scene.CreateEntity();
+    scene.GetRegistry().emplace<polyizon::TagComponent>(entity, "Spot Light");
+    scene.GetRegistry().emplace<polyizon::TransformComponent>(entity);
+    scene.GetRegistry().emplace<polyizon::SpotLightComponent>(entity);
+    Refresh();
+}
+
 void HierarchyPanel::AddMeshEntity(const QString& tagName, const std::filesystem::path& modelRelativePath) {
     polyizon::EditorViewportRenderer* renderer = m_ViewportWindow->GetRenderer();
     if (!renderer) {
         return;
     }
+    m_ViewportWindow->MaybeWarnEditDuringPlay(this);
 
     std::shared_ptr<polyizon::Mesh> mesh;
     try {
@@ -137,6 +175,7 @@ void HierarchyPanel::OnDeleteSelected() {
     if (!item) {
         return;
     }
+    m_ViewportWindow->MaybeWarnEditDuringPlay(this);
 
     const entt::entity entity = static_cast<entt::entity>(item->data(kEntityRole).toUInt());
 

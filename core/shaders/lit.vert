@@ -21,6 +21,11 @@ layout(location = 1) in vec3 inNormal;
 
 layout(location = 0) out vec3 vWorldNormal;
 layout(location = 1) out vec4 vLightSpacePos;
+// Phase 19: point/spot light contribution needs the fragment's actual world
+// position (not just its light-space depth) to compute per-light distance
+// and direction — see lit.frag/voxel_lit.frag's ComputePointLightContribution/
+// ComputeSpotLightContribution.
+layout(location = 2) out vec3 vWorldPos;
 
 void main() {
     vec4 worldPos = pc.model * vec4(inPosition, 1.0);
@@ -32,4 +37,5 @@ void main() {
     // if a future scene needs non-uniform scaling.
     vWorldNormal = mat3(pc.model) * inNormal;
     vLightSpacePos = ubo.lightSpaceMatrix * worldPos;
+    vWorldPos = worldPos.xyz;
 }
