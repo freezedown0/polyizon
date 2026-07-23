@@ -28,7 +28,9 @@ target_sources(polyizon_core
         src/vulkan/swapchain.cpp
         src/vulkan/pipeline.cpp
         src/vulkan/sky_pipeline.cpp
+        src/vulkan/classic_sky_pipeline.cpp
         src/vulkan/lit_pipeline.cpp
+        src/vulkan/voxel_lit_pipeline.cpp
         src/vulkan/shadow_pipeline.cpp
         src/vulkan/buffer.cpp
         src/vulkan/image.cpp
@@ -131,8 +133,10 @@ set(POLYIZON_SHADER_SOURCES
     ${POLYIZON_SHADER_SOURCE_DIR}/triangle.frag
     ${POLYIZON_SHADER_SOURCE_DIR}/sky.vert
     ${POLYIZON_SHADER_SOURCE_DIR}/sky.frag
+    ${POLYIZON_SHADER_SOURCE_DIR}/classic_sky.frag
     ${POLYIZON_SHADER_SOURCE_DIR}/lit.vert
     ${POLYIZON_SHADER_SOURCE_DIR}/lit.frag
+    ${POLYIZON_SHADER_SOURCE_DIR}/voxel_lit.frag
     ${POLYIZON_SHADER_SOURCE_DIR}/shadow.vert
 )
 

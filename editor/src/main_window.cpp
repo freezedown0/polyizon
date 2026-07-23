@@ -11,6 +11,7 @@
 #include <entt/entt.hpp>
 
 #include <QAction>
+#include <QActionGroup>
 #include <QDockWidget>
 #include <QFileDialog>
 #include <QInputDialog>
@@ -69,6 +70,7 @@ MainWindow::MainWindow(QWidget* parent)
     // refreshing directly from LoadSceneFile, which would miss the deferred
     // case entirely.
     connect(m_ViewportWindow, &VulkanViewportWindow::SceneLoaded, m_HierarchyPanel, &HierarchyPanel::Refresh);
+    connect(m_ViewportWindow, &VulkanViewportWindow::SceneLoaded, this, &MainWindow::SyncLightingModeMenu);
 
     QMenu* fileMenu = menuBar()->addMenu("&File");
     fileMenu->addAction("&New Project...", this, &MainWindow::OnNewProject);
@@ -76,6 +78,28 @@ MainWindow::MainWindow(QWidget* parent)
     fileMenu->addSeparator();
     m_SaveSceneAction = fileMenu->addAction("&Save Scene", QKeySequence::Save, this, &MainWindow::OnSaveScene);
     m_SaveSceneAction->setEnabled(false); // nothing to save until a project/scene is loaded
+
+    // Realistic/Voxel: a live in-memory toggle on whichever scene is
+    // currently loaded (see SetLightingMode) — not a global editor setting,
+    // since different scenes can want different modes (see
+    // SceneLightingSettings). No project/scene loaded yet -> both actions
+    // are harmless no-ops (SetLightingMode guards on a null renderer).
+    QMenu* lightingMenu = menuBar()->addMenu("&Lighting");
+    auto* lightingModeGroup = new QActionGroup(this);
+    lightingModeGroup->setExclusive(true);
+
+    m_RealisticLightingAction = lightingMenu->addAction("&Realistic");
+    m_RealisticLightingAction->setCheckable(true);
+    m_RealisticLightingAction->setChecked(true);
+    lightingModeGroup->addAction(m_RealisticLightingAction);
+    connect(m_RealisticLightingAction, &QAction::triggered, this,
+        [this]() { SetLightingMode(polyizon::LightingMode::Realistic); });
+
+    m_VoxelLightingAction = lightingMenu->addAction("&Voxel");
+    m_VoxelLightingAction->setCheckable(true);
+    lightingModeGroup->addAction(m_VoxelLightingAction);
+    connect(m_VoxelLightingAction, &QAction::triggered, this,
+        [this]() { SetLightingMode(polyizon::LightingMode::Voxel); });
 
     m_RenderTimer = new QTimer(this);
     connect(m_RenderTimer, &QTimer::timeout, this, [this]() {
@@ -153,4 +177,24 @@ void MainWindow::LoadSceneFile(const std::filesystem::path& scenePath) {
     m_CurrentScenePath = scenePath;
     m_SaveSceneAction->setEnabled(true);
     m_InspectorPanel->SetSelectedEntity(entt::null);
+}
+
+void MainWindow::SetLightingMode(polyizon::LightingMode mode) {
+    polyizon::EditorViewportRenderer* renderer = m_ViewportWindow->GetRenderer();
+    if (!renderer) {
+        return; // no project/scene loaded yet - nothing to toggle
+    }
+    renderer->GetScene().GetLightingSettings().mode = mode;
+}
+
+void MainWindow::SyncLightingModeMenu() {
+    polyizon::EditorViewportRenderer* renderer = m_ViewportWindow->GetRenderer();
+    if (!renderer) {
+        return;
+    }
+    const bool isVoxel = renderer->GetScene().GetLightingSettings().mode == polyizon::LightingMode::Voxel;
+    // setChecked on a QActionGroup-exclusive action automatically unchecks
+    // its sibling - only need to (un)check the one that changed.
+    m_VoxelLightingAction->setChecked(isVoxel);
+    m_RealisticLightingAction->setChecked(!isVoxel);
 }

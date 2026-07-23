@@ -3,6 +3,7 @@
 #include "mesh_import.hpp"
 
 #include "polyizon/scene/components.hpp"
+#include "polyizon/scene/lighting_settings.hpp"
 #include "polyizon/vulkan/context.hpp"
 
 #include <nlohmann/json.hpp>
@@ -37,6 +38,18 @@ json Vec3ToJson(const glm::vec3& v) {
 
 glm::vec3 JsonToVec3(const json& j) {
     return glm::vec3(j.at(0).get<float>(), j.at(1).get<float>(), j.at(2).get<float>());
+}
+
+const char* LightingModeToString(polyizon::LightingMode mode) {
+    switch (mode) {
+        case polyizon::LightingMode::Voxel: return "Voxel";
+        case polyizon::LightingMode::Realistic:
+        default: return "Realistic";
+    }
+}
+
+polyizon::LightingMode LightingModeFromString(const std::string& s) {
+    return s == "Voxel" ? polyizon::LightingMode::Voxel : polyizon::LightingMode::Realistic;
 }
 
 } // namespace
@@ -74,8 +87,16 @@ void SaveScene(const polyizon::Scene& scene, const std::filesystem::path& path) 
         entitiesJson.push_back(std::move(entityJson));
     }
 
+    const polyizon::SceneLightingSettings& lighting = scene.GetLightingSettings();
+    json lightingJson;
+    lightingJson["mode"] = LightingModeToString(lighting.mode);
+    lightingJson["sunElevationDegrees"] = lighting.sunElevationDegrees;
+    lightingJson["sunAzimuthDegrees"] = lighting.sunAzimuthDegrees;
+    lightingJson["ambientStrength"] = lighting.ambientStrength;
+
     json root;
     root["entities"] = std::move(entitiesJson);
+    root["lighting"] = std::move(lightingJson);
 
     std::filesystem::create_directories(path.parent_path());
     std::ofstream file(path);
@@ -142,6 +163,20 @@ polyizon::Scene LoadScene(polyizon::VulkanContext& context, const std::filesyste
         if (entityJson.contains("script")) {
             scene.GetRegistry().emplace<polyizon::ScriptComponent>(entity, entityJson.at("script").get<std::string>());
         }
+    }
+
+    // Pre-Phase-18 scene files have no "lighting" key at all — the
+    // default-constructed SceneLightingSettings (Realistic, same sun/ambient
+    // defaults EditorViewportRenderer used to hardcode) matches their prior
+    // behavior exactly, so this is skippable rather than required.
+    if (root.contains("lighting")) {
+        const auto& lightingJson = root.at("lighting");
+        polyizon::SceneLightingSettings lighting;
+        lighting.mode = LightingModeFromString(lightingJson.value("mode", std::string("Realistic")));
+        lighting.sunElevationDegrees = lightingJson.value("sunElevationDegrees", 25.0f);
+        lighting.sunAzimuthDegrees = lightingJson.value("sunAzimuthDegrees", 0.0f);
+        lighting.ambientStrength = lightingJson.value("ambientStrength", 0.15f);
+        scene.GetLightingSettings() = lighting;
     }
 
     return scene;

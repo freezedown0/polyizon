@@ -20,7 +20,11 @@ EditorViewportRenderer::EditorViewportRenderer(HWND hwnd, HINSTANCE hinstance, s
     m_Swapchain = std::make_unique<Swapchain>(*m_VulkanContext, width, height);
     m_SkyPipeline = std::make_unique<SkyPipeline>(
         m_VulkanContext->GetDevice(), m_Swapchain->GetImageFormat(), m_Swapchain->GetDepthFormat());
+    m_ClassicSkyPipeline = std::make_unique<ClassicSkyPipeline>(
+        m_VulkanContext->GetDevice(), m_Swapchain->GetImageFormat(), m_Swapchain->GetDepthFormat());
     m_LitPipeline = std::make_unique<LitPipeline>(
+        m_VulkanContext->GetDevice(), m_Swapchain->GetImageFormat(), m_Swapchain->GetDepthFormat());
+    m_VoxelLitPipeline = std::make_unique<VoxelLitPipeline>(
         m_VulkanContext->GetDevice(), m_Swapchain->GetImageFormat(), m_Swapchain->GetDepthFormat());
     m_ShadowPipeline = std::make_unique<ShadowPipeline>(m_VulkanContext->GetDevice(), m_Swapchain->GetDepthFormat());
 
@@ -30,8 +34,15 @@ EditorViewportRenderer::EditorViewportRenderer(HWND hwnd, HINSTANCE hinstance, s
         cloudNoiseParams.resolution, cloudNoiseParams.resolution, cloudNoiseParams.resolution);
 
     // Reuses the swapchain's already-queried supported depth format (see
-    // ShadowMap's constructor comment) rather than re-deriving it.
-    m_ShadowMap = std::make_unique<ShadowMap>(*m_VulkanContext, m_Swapchain->GetDepthFormat(), kShadowMapResolution);
+    // ShadowMap's constructor comment) rather than re-deriving it. Both
+    // modes' maps are created up front and stay resident for the whole
+    // session (see the class doc comment) — a scene can switch modes, or a
+    // newly loaded scene can use whichever mode wasn't active yet, at any
+    // time without waiting on GPU resource creation.
+    m_RealisticShadowMap = std::make_unique<ShadowMap>(
+        *m_VulkanContext, m_Swapchain->GetDepthFormat(), kRealisticShadowMapResolution, ShadowSamplerMode::HardwarePcf);
+    m_VoxelShadowMap = std::make_unique<ShadowMap>(
+        *m_VulkanContext, m_Swapchain->GetDepthFormat(), kVoxelShadowMapResolution, ShadowSamplerMode::PlainNearest);
 
     // m_Scene starts empty (default-constructed) — populated only via a
     // later LoadScene() call, once MainWindow's File > New/Open Project
@@ -70,8 +81,9 @@ float EditorViewportRenderer::GetElapsedSeconds() const {
 }
 
 glm::vec3 EditorViewportRenderer::GetSunDirection() const {
-    const float elevation = glm::radians(m_SunElevationDegrees);
-    const float azimuth = glm::radians(m_SunAzimuthDegrees);
+    const SceneLightingSettings& lighting = m_Scene.GetLightingSettings();
+    const float elevation = glm::radians(lighting.sunElevationDegrees);
+    const float azimuth = glm::radians(lighting.sunAzimuthDegrees);
     return glm::normalize(glm::vec3(
         std::cos(elevation) * std::cos(azimuth),
         std::sin(elevation),
@@ -175,24 +187,26 @@ void EditorViewportRenderer::CreateDescriptorResources() {
             m_VulkanContext->GetAllocator(), sizeof(LitUniformBufferObject), VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT);
         m_SkyUniformBuffers[i] = std::make_unique<Buffer>(
             m_VulkanContext->GetAllocator(), sizeof(SkyUniformBufferObject), VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT);
+        m_ClassicSkyUniformBuffers[i] = std::make_unique<Buffer>(m_VulkanContext->GetAllocator(),
+            sizeof(ClassicSkyUniformBufferObject), VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT);
     }
 
-    // poolSizes[0] (UBO) covers both the lit pipeline's per-frame UBO and the
-    // sky pipeline's per-frame UBO — kMaxFramesInFlight * 2 total sets come
-    // out of this one pool (lit set + sky set per frame-in-flight).
-    // poolSizes[1] (combined image sampler) similarly covers both the lit
-    // pipeline's shadow map and the sky pipeline's cloud noise volume.
+    // Four sets per frame-in-flight now: lit (Realistic), voxelLit (Voxel —
+    // reuses m_LitUniformBuffers, see its member comment), sky (Realistic),
+    // classicSky (Voxel). UBO descriptors: one per set, all four. Combined-
+    // image-sampler descriptors: lit's shadow map, voxelLit's shadow map,
+    // sky's cloud noise volume — classicSky has none (binding 0 only).
     std::array<VkDescriptorPoolSize, 2> poolSizes{};
     poolSizes[0].type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
-    poolSizes[0].descriptorCount = kMaxFramesInFlight * 2;
+    poolSizes[0].descriptorCount = kMaxFramesInFlight * 4;
     poolSizes[1].type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-    poolSizes[1].descriptorCount = kMaxFramesInFlight * 2;
+    poolSizes[1].descriptorCount = kMaxFramesInFlight * 3;
 
     VkDescriptorPoolCreateInfo poolInfo{};
     poolInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
     poolInfo.poolSizeCount = static_cast<std::uint32_t>(poolSizes.size());
     poolInfo.pPoolSizes = poolSizes.data();
-    poolInfo.maxSets = kMaxFramesInFlight * 2;
+    poolInfo.maxSets = kMaxFramesInFlight * 4;
 
     if (vkCreateDescriptorPool(device, &poolInfo, nullptr, &m_DescriptorPool) != VK_SUCCESS) {
         throw std::runtime_error("Failed to create Vulkan descriptor pool");
@@ -211,6 +225,19 @@ void EditorViewportRenderer::CreateDescriptorResources() {
         throw std::runtime_error("Failed to allocate Vulkan lit descriptor sets");
     }
 
+    std::array<VkDescriptorSetLayout, kMaxFramesInFlight> voxelLitLayouts{};
+    voxelLitLayouts.fill(m_VoxelLitPipeline->GetDescriptorSetLayout());
+
+    VkDescriptorSetAllocateInfo voxelLitAllocInfo{};
+    voxelLitAllocInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+    voxelLitAllocInfo.descriptorPool = m_DescriptorPool;
+    voxelLitAllocInfo.descriptorSetCount = kMaxFramesInFlight;
+    voxelLitAllocInfo.pSetLayouts = voxelLitLayouts.data();
+
+    if (vkAllocateDescriptorSets(device, &voxelLitAllocInfo, m_VoxelLitDescriptorSets.data()) != VK_SUCCESS) {
+        throw std::runtime_error("Failed to allocate Vulkan voxel-lit descriptor sets");
+    }
+
     std::array<VkDescriptorSetLayout, kMaxFramesInFlight> skyLayouts{};
     skyLayouts.fill(m_SkyPipeline->GetDescriptorSetLayout());
 
@@ -224,16 +251,29 @@ void EditorViewportRenderer::CreateDescriptorResources() {
         throw std::runtime_error("Failed to allocate Vulkan sky descriptor sets");
     }
 
+    std::array<VkDescriptorSetLayout, kMaxFramesInFlight> classicSkyLayouts{};
+    classicSkyLayouts.fill(m_ClassicSkyPipeline->GetDescriptorSetLayout());
+
+    VkDescriptorSetAllocateInfo classicSkyAllocInfo{};
+    classicSkyAllocInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+    classicSkyAllocInfo.descriptorPool = m_DescriptorPool;
+    classicSkyAllocInfo.descriptorSetCount = kMaxFramesInFlight;
+    classicSkyAllocInfo.pSetLayouts = classicSkyLayouts.data();
+
+    if (vkAllocateDescriptorSets(device, &classicSkyAllocInfo, m_ClassicSkyDescriptorSets.data()) != VK_SUCCESS) {
+        throw std::runtime_error("Failed to allocate Vulkan classic-sky descriptor sets");
+    }
+
     for (std::uint32_t i = 0; i < kMaxFramesInFlight; ++i) {
         VkDescriptorBufferInfo litBufferInfo{};
         litBufferInfo.buffer = m_LitUniformBuffers[i]->GetBuffer();
         litBufferInfo.offset = 0;
         litBufferInfo.range = sizeof(LitUniformBufferObject);
 
-        VkDescriptorImageInfo shadowMapInfo{};
-        shadowMapInfo.sampler = m_ShadowMap->GetSampler();
-        shadowMapInfo.imageView = m_ShadowMap->GetImageView();
-        shadowMapInfo.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        VkDescriptorImageInfo realisticShadowMapInfo{};
+        realisticShadowMapInfo.sampler = m_RealisticShadowMap->GetSampler();
+        realisticShadowMapInfo.imageView = m_RealisticShadowMap->GetImageView();
+        realisticShadowMapInfo.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
 
         std::array<VkWriteDescriptorSet, 2> litWrites{};
         litWrites[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
@@ -248,9 +288,35 @@ void EditorViewportRenderer::CreateDescriptorResources() {
         litWrites[1].dstBinding = 1;
         litWrites[1].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
         litWrites[1].descriptorCount = 1;
-        litWrites[1].pImageInfo = &shadowMapInfo;
+        litWrites[1].pImageInfo = &realisticShadowMapInfo;
 
         vkUpdateDescriptorSets(device, static_cast<std::uint32_t>(litWrites.size()), litWrites.data(), 0, nullptr);
+
+        // Same m_LitUniformBuffers[i] buffer as above (binding 0) — only the
+        // shadow sampler (binding 1) differs, pointing at the coarse voxel
+        // ShadowMap instead. See the header's m_LitUniformBuffers comment.
+        VkDescriptorImageInfo voxelShadowMapInfo{};
+        voxelShadowMapInfo.sampler = m_VoxelShadowMap->GetSampler();
+        voxelShadowMapInfo.imageView = m_VoxelShadowMap->GetImageView();
+        voxelShadowMapInfo.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+
+        std::array<VkWriteDescriptorSet, 2> voxelLitWrites{};
+        voxelLitWrites[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        voxelLitWrites[0].dstSet = m_VoxelLitDescriptorSets[i];
+        voxelLitWrites[0].dstBinding = 0;
+        voxelLitWrites[0].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+        voxelLitWrites[0].descriptorCount = 1;
+        voxelLitWrites[0].pBufferInfo = &litBufferInfo;
+
+        voxelLitWrites[1].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        voxelLitWrites[1].dstSet = m_VoxelLitDescriptorSets[i];
+        voxelLitWrites[1].dstBinding = 1;
+        voxelLitWrites[1].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        voxelLitWrites[1].descriptorCount = 1;
+        voxelLitWrites[1].pImageInfo = &voxelShadowMapInfo;
+
+        vkUpdateDescriptorSets(
+            device, static_cast<std::uint32_t>(voxelLitWrites.size()), voxelLitWrites.data(), 0, nullptr);
 
         VkDescriptorBufferInfo skyBufferInfo{};
         skyBufferInfo.buffer = m_SkyUniformBuffers[i]->GetBuffer();
@@ -278,6 +344,21 @@ void EditorViewportRenderer::CreateDescriptorResources() {
         skyWrites[1].pImageInfo = &cloudNoiseInfo;
 
         vkUpdateDescriptorSets(device, static_cast<std::uint32_t>(skyWrites.size()), skyWrites.data(), 0, nullptr);
+
+        VkDescriptorBufferInfo classicSkyBufferInfo{};
+        classicSkyBufferInfo.buffer = m_ClassicSkyUniformBuffers[i]->GetBuffer();
+        classicSkyBufferInfo.offset = 0;
+        classicSkyBufferInfo.range = sizeof(ClassicSkyUniformBufferObject);
+
+        VkWriteDescriptorSet classicSkyWrite{};
+        classicSkyWrite.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        classicSkyWrite.dstSet = m_ClassicSkyDescriptorSets[i];
+        classicSkyWrite.dstBinding = 0;
+        classicSkyWrite.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+        classicSkyWrite.descriptorCount = 1;
+        classicSkyWrite.pBufferInfo = &classicSkyBufferInfo;
+
+        vkUpdateDescriptorSets(device, 1, &classicSkyWrite, 0, nullptr);
     }
 }
 
@@ -300,7 +381,7 @@ void EditorViewportRenderer::UpdateLitUniformBuffer(std::uint32_t frameIndex, Vk
     ubo.proj[1][1] *= -1.0f;
 
     ubo.lightSpaceMatrix = GetLightSpaceMatrix();
-    ubo.sunDirectionAndAmbient = glm::vec4(GetSunDirection(), m_AmbientStrength);
+    ubo.sunDirectionAndAmbient = glm::vec4(GetSunDirection(), m_Scene.GetLightingSettings().ambientStrength);
 
     m_LitUniformBuffers[frameIndex]->Upload(&ubo, sizeof(ubo));
 }
@@ -329,27 +410,59 @@ void EditorViewportRenderer::UpdateSkyUniformBuffer(std::uint32_t frameIndex, Vk
     m_SkyUniformBuffers[frameIndex]->Upload(&sky, sizeof(sky));
 }
 
+void EditorViewportRenderer::UpdateClassicSkyUniformBuffer(std::uint32_t frameIndex, VkExtent2D extent) {
+    ClassicSkyUniformBufferObject sky{};
+    sky.invView = glm::inverse(m_Camera.GetViewMatrix());
+
+    const float aspect = static_cast<float>(extent.width) / static_cast<float>(extent.height);
+    glm::mat4 proj = glm::perspective(glm::radians(45.0f), aspect, 0.1f, 50.0f);
+    proj[1][1] *= -1.0f;
+    sky.invProj = glm::inverse(proj);
+
+    // w = sun angular radius, same value sky.frag's sun disk uses (see
+    // timeAndSun.y in UpdateSkyUniformBuffer) so both sky styles show a
+    // similarly-sized sun.
+    sky.sunDirection = glm::vec4(GetSunDirection(), glm::radians(1.5f));
+
+    // Fixed, unauthored-yet palette — a simple classic day/night gradient.
+    // No Qt panel or scene data exposes these this phase (same tier of
+    // polish as the Realistic sky's cloud/atmosphere tunables).
+    sky.dayHorizonColor = glm::vec4(0.75f, 0.85f, 1.0f, 0.0f);
+    sky.dayZenithColor = glm::vec4(0.25f, 0.55f, 0.95f, 0.0f);
+    sky.nightHorizonColor = glm::vec4(0.05f, 0.06f, 0.12f, 0.0f);
+    sky.nightZenithColor = glm::vec4(0.01f, 0.01f, 0.04f, 0.0f);
+
+    m_ClassicSkyUniformBuffers[frameIndex]->Upload(&sky, sizeof(sky));
+}
+
 void EditorViewportRenderer::RenderShadowPass(VkCommandBuffer cmd) {
+    const bool voxelMode = (m_Scene.GetLightingSettings().mode == LightingMode::Voxel);
+    ShadowMap& activeShadowMap = voxelMode ? *m_VoxelShadowMap : *m_RealisticShadowMap;
+    bool& firstFrame = voxelMode ? m_VoxelShadowMapFirstFrame : m_RealisticShadowMapFirstFrame;
+
     const VkImageSubresourceRange depthRange{ VK_IMAGE_ASPECT_DEPTH_BIT, 0, 1, 0, 1 };
 
     VkImageMemoryBarrier2 toDepthAttachment{};
     toDepthAttachment.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
-    // First frame: the shadow map's initial layout is UNDEFINED (see
-    // ShadowMap::CreateImage()), transitioned from TOP_OF_PIPE/NONE. Every
-    // subsequent frame: it's coming from the previous frame's shader-read
-    // (see the barrier after vkCmdEndRendering below), so the source stage/
-    // access must match what actually last touched it.
+    // First frame THIS MAP has ever rendered: its initial layout is UNDEFINED
+    // (see ShadowMap::CreateImage()), transitioned from TOP_OF_PIPE/NONE.
+    // Every subsequent render of it: it's coming from a previous frame's
+    // shader-read (see the barrier after vkCmdEndRendering below), so the
+    // source stage/access must match what actually last touched it. Tracked
+    // per-map (see the header's m_RealisticShadowMapFirstFrame/
+    // m_VoxelShadowMapFirstFrame comment) since the other map may have
+    // already rendered many frames by the time this one gets its first.
     toDepthAttachment.srcStageMask =
-        m_FirstFrame ? VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT : VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT;
-    toDepthAttachment.srcAccessMask = m_FirstFrame ? VK_ACCESS_2_NONE : VK_ACCESS_2_SHADER_READ_BIT;
+        firstFrame ? VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT : VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT;
+    toDepthAttachment.srcAccessMask = firstFrame ? VK_ACCESS_2_NONE : VK_ACCESS_2_SHADER_READ_BIT;
     toDepthAttachment.dstStageMask =
         VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT;
     toDepthAttachment.dstAccessMask = VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
-    toDepthAttachment.oldLayout = m_FirstFrame ? VK_IMAGE_LAYOUT_UNDEFINED : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    toDepthAttachment.oldLayout = firstFrame ? VK_IMAGE_LAYOUT_UNDEFINED : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
     toDepthAttachment.newLayout = VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL;
     toDepthAttachment.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
     toDepthAttachment.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    toDepthAttachment.image = m_ShadowMap->GetImage();
+    toDepthAttachment.image = activeShadowMap.GetImage();
     toDepthAttachment.subresourceRange = depthRange;
 
     VkDependencyInfo toDepthDep{};
@@ -360,13 +473,13 @@ void EditorViewportRenderer::RenderShadowPass(VkCommandBuffer cmd) {
 
     VkRenderingAttachmentInfo depthAttachment{};
     depthAttachment.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
-    depthAttachment.imageView = m_ShadowMap->GetImageView();
+    depthAttachment.imageView = activeShadowMap.GetImageView();
     depthAttachment.imageLayout = VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL;
     depthAttachment.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
     depthAttachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE; // read back by the lit pass this same frame
     depthAttachment.clearValue.depthStencil = { 1.0f, 0 };
 
-    const std::uint32_t resolution = m_ShadowMap->GetResolution();
+    const std::uint32_t resolution = activeShadowMap.GetResolution();
 
     VkRenderingInfo renderingInfo{};
     renderingInfo.sType = VK_STRUCTURE_TYPE_RENDERING_INFO;
@@ -419,7 +532,7 @@ void EditorViewportRenderer::RenderShadowPass(VkCommandBuffer cmd) {
     toShaderReadDep.pImageMemoryBarriers = &toShaderRead;
     vkCmdPipelineBarrier2(cmd, &toShaderReadDep);
 
-    m_FirstFrame = false;
+    firstFrame = false;
 }
 
 void EditorViewportRenderer::RenderMainPass(VkCommandBuffer cmd, VkImage colorImage, std::uint32_t imageIndex, VkExtent2D extent) {
@@ -496,39 +609,30 @@ void EditorViewportRenderer::RenderMainPass(VkCommandBuffer cmd, VkImage colorIm
     VkRect2D scissor{ { 0, 0 }, extent };
     vkCmdSetScissor(cmd, 0, 1, &scissor);
 
-    // Sky pass first (background), same as before this phase.
-    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_SkyPipeline->GetPipeline());
-    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_SkyPipeline->GetLayout(), 0, 1,
-        &m_SkyDescriptorSets[m_CurrentFrame], 0, nullptr);
-    vkCmdDraw(cmd, 3, 1, 0, 0);
+    // Sky pass first (background), then the lit scene — which pipeline pair
+    // depends on the loaded scene's lighting mode (see the class doc
+    // comment). Both pipeline sets stay resident regardless of which is
+    // drawn this frame.
+    if (m_Scene.GetLightingSettings().mode == LightingMode::Voxel) {
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_ClassicSkyPipeline->GetPipeline());
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_ClassicSkyPipeline->GetLayout(), 0, 1,
+            &m_ClassicSkyDescriptorSets[m_CurrentFrame], 0, nullptr);
+        vkCmdDraw(cmd, 3, 1, 0, 0);
 
-    // Lit scene pass: each entity is a separate draw with its own push-
-    // constant model matrix/color (see LitPipeline) rather than an instanced
-    // draw — this scene has a handful of distinct meshes, not many identical
-    // instances.
-    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_LitPipeline->GetPipeline());
-    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_LitPipeline->GetLayout(), 0, 1,
-        &m_LitDescriptorSets[m_CurrentFrame], 0, nullptr);
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_VoxelLitPipeline->GetPipeline());
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_VoxelLitPipeline->GetLayout(), 0, 1,
+            &m_VoxelLitDescriptorSets[m_CurrentFrame], 0, nullptr);
+        DrawLitEntities(cmd, m_VoxelLitPipeline->GetLayout());
+    } else {
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_SkyPipeline->GetPipeline());
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_SkyPipeline->GetLayout(), 0, 1,
+            &m_SkyDescriptorSets[m_CurrentFrame], 0, nullptr);
+        vkCmdDraw(cmd, 3, 1, 0, 0);
 
-    auto view = m_Scene.GetRegistry().view<TransformComponent, MeshComponent, MaterialComponent>();
-    for (auto entity : view) {
-        const auto& [transform, meshComponent, material] = view.get<TransformComponent, MeshComponent, MaterialComponent>(entity);
-
-        LitPushConstants pc{};
-        const glm::mat4 model = transform.GetMatrix();
-        std::memcpy(pc.model, &model, sizeof(pc.model));
-        pc.baseColor[0] = material.baseColor.r;
-        pc.baseColor[1] = material.baseColor.g;
-        pc.baseColor[2] = material.baseColor.b;
-        pc.baseColor[3] = 1.0f;
-        vkCmdPushConstants(cmd, m_LitPipeline->GetLayout(),
-            VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(pc), &pc);
-
-        const VkBuffer vertexBuffer = meshComponent.mesh->GetVertexBuffer();
-        const VkDeviceSize offset = 0;
-        vkCmdBindVertexBuffers(cmd, 0, 1, &vertexBuffer, &offset);
-        vkCmdBindIndexBuffer(cmd, meshComponent.mesh->GetIndexBuffer(), 0, VK_INDEX_TYPE_UINT32);
-        vkCmdDrawIndexed(cmd, meshComponent.mesh->GetIndexCount(), 1, 0, 0, 0);
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_LitPipeline->GetPipeline());
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_LitPipeline->GetLayout(), 0, 1,
+            &m_LitDescriptorSets[m_CurrentFrame], 0, nullptr);
+        DrawLitEntities(cmd, m_LitPipeline->GetLayout());
     }
 
     vkCmdEndRendering(cmd);
@@ -546,6 +650,35 @@ void EditorViewportRenderer::RenderMainPass(VkCommandBuffer cmd, VkImage colorIm
     toPresentDep.imageMemoryBarrierCount = 1;
     toPresentDep.pImageMemoryBarriers = &toPresent;
     vkCmdPipelineBarrier2(cmd, &toPresentDep);
+}
+
+void EditorViewportRenderer::DrawLitEntities(VkCommandBuffer cmd, VkPipelineLayout pipelineLayout) {
+    // Each entity is a separate draw with its own push-constant model
+    // matrix/color (see LitPipeline/VoxelLitPipeline's shared
+    // LitPushConstants) rather than an instanced draw — this scene has a
+    // handful of distinct meshes, not many identical instances. Identical
+    // for both lighting modes; only the caller's already-bound
+    // pipeline/descriptor set differs.
+    auto view = m_Scene.GetRegistry().view<TransformComponent, MeshComponent, MaterialComponent>();
+    for (auto entity : view) {
+        const auto& [transform, meshComponent, material] = view.get<TransformComponent, MeshComponent, MaterialComponent>(entity);
+
+        LitPushConstants pc{};
+        const glm::mat4 model = transform.GetMatrix();
+        std::memcpy(pc.model, &model, sizeof(pc.model));
+        pc.baseColor[0] = material.baseColor.r;
+        pc.baseColor[1] = material.baseColor.g;
+        pc.baseColor[2] = material.baseColor.b;
+        pc.baseColor[3] = 1.0f;
+        vkCmdPushConstants(cmd, pipelineLayout,
+            VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(pc), &pc);
+
+        const VkBuffer vertexBuffer = meshComponent.mesh->GetVertexBuffer();
+        const VkDeviceSize offset = 0;
+        vkCmdBindVertexBuffers(cmd, 0, 1, &vertexBuffer, &offset);
+        vkCmdBindIndexBuffer(cmd, meshComponent.mesh->GetIndexBuffer(), 0, VK_INDEX_TYPE_UINT32);
+        vkCmdDrawIndexed(cmd, meshComponent.mesh->GetIndexCount(), 1, 0, 0, 0);
+    }
 }
 
 void EditorViewportRenderer::RenderFrame() {
@@ -581,8 +714,13 @@ void EditorViewportRenderer::RenderFrame() {
 
     const VkExtent2D extent = m_Swapchain->GetExtent();
     const float time = GetElapsedSeconds();
+    // All three buffers are updated every frame regardless of which mode is
+    // active this frame — cheap (three small mapped-memory uploads) and
+    // avoids the buffers ever holding stale data from before the last mode
+    // switch if a scene's mode is toggled mid-session.
     UpdateLitUniformBuffer(m_CurrentFrame, extent);
     UpdateSkyUniformBuffer(m_CurrentFrame, extent, time);
+    UpdateClassicSkyUniformBuffer(m_CurrentFrame, extent);
 
     VkCommandBuffer cmd = m_CommandBuffers[m_CurrentFrame];
     vkResetCommandBuffer(cmd, 0);

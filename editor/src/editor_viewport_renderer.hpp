@@ -4,8 +4,11 @@
 
 #include "polyizon/camera.hpp"
 #include "polyizon/scene/components.hpp"
+#include "polyizon/scene/lighting_settings.hpp"
 #include "polyizon/scene/scene.hpp"
 #include "polyizon/vulkan/buffer.hpp"
+#include "polyizon/vulkan/classic_sky_pipeline.hpp"
+#include "polyizon/vulkan/classic_sky_uniform_buffer_object.hpp"
 #include "polyizon/vulkan/context.hpp"
 #include "polyizon/vulkan/lit_pipeline.hpp"
 #include "polyizon/vulkan/lit_uniform_buffer_object.hpp"
@@ -16,6 +19,7 @@
 #include "polyizon/vulkan/sky_uniform_buffer_object.hpp"
 #include "polyizon/vulkan/swapchain.hpp"
 #include "polyizon/vulkan/texture3d.hpp"
+#include "polyizon/vulkan/voxel_lit_pipeline.hpp"
 
 #include <array>
 #include <chrono>
@@ -40,8 +44,18 @@ namespace polyizon {
 // too). Phase 16: m_Scene starts empty and is only ever populated via
 // LoadScene() (called from MainWindow's File > New/Open Project handlers,
 // see project.hpp/scene_serializer.hpp) — there is no hardcoded sample scene
-// built directly in this class anymore. The sky/cloud background
-// (SkyPipeline) is unchanged throughout.
+// built directly in this class anymore.
+//
+// Phase 18 gave this class a SECOND full rendering path (Realistic: the
+// original SkyPipeline/ShadowMap/LitPipeline described above; Voxel: a flat
+// ClassicSkyPipeline sky and a deliberately coarse ShadowSamplerMode::
+// PlainNearest ShadowMap sampled by VoxelLitPipeline for blocky shadows) —
+// both stay resident at all times, and RenderShadowPass()/RenderMainPass()
+// pick which one to draw each frame from whichever scene is currently
+// loaded (m_Scene.GetLightingSettings().mode), so switching a scene's mode
+// or loading a different scene with a different mode never needs to
+// recreate any GPU resource. Sun direction/ambient strength are also owned
+// by the scene now (SceneLightingSettings), not this class.
 class EditorViewportRenderer {
 public:
     // hwnd/hinstance come from VulkanViewportWindow's winId()/
@@ -105,14 +119,23 @@ private:
     void DestroyDescriptorResources();
     void UpdateLitUniformBuffer(std::uint32_t frameIndex, VkExtent2D extent);
     void UpdateSkyUniformBuffer(std::uint32_t frameIndex, VkExtent2D extent, float time);
+    void UpdateClassicSkyUniformBuffer(std::uint32_t frameIndex, VkExtent2D extent);
     void RenderShadowPass(VkCommandBuffer cmd);
     void RenderMainPass(VkCommandBuffer cmd, VkImage colorImage, std::uint32_t imageIndex, VkExtent2D extent);
+    // Shared by both RenderMainPass branches (Realistic/Voxel): identical
+    // per-entity draw loop, only the bound pipeline/descriptor set differs
+    // (which the caller has already bound before calling this).
+    void DrawLitEntities(VkCommandBuffer cmd, VkPipelineLayout pipelineLayout);
     float GetElapsedSeconds() const;
     glm::vec3 GetSunDirection() const;
     glm::mat4 GetLightSpaceMatrix() const;
 
     static constexpr std::uint32_t kMaxFramesInFlight = 2;
-    static constexpr std::uint32_t kShadowMapResolution = 2048;
+    static constexpr std::uint32_t kRealisticShadowMapResolution = 2048;
+    // Deliberately tiny — see ShadowSamplerMode::PlainNearest and
+    // voxel_lit.frag's kVoxelDepthSlices for how this becomes a genuinely
+    // blocky "4x4x4" shadow rather than a low-res-but-smooth one.
+    static constexpr std::uint32_t kVoxelShadowMapResolution = 4;
 
     // Declaration order matches Application's exactly, for the same
     // reverse-declaration-order destruction reasoning (see application.hpp) —
@@ -121,10 +144,16 @@ private:
     std::unique_ptr<VulkanContext> m_VulkanContext;
     std::unique_ptr<Swapchain> m_Swapchain;
     std::unique_ptr<SkyPipeline> m_SkyPipeline;
+    std::unique_ptr<ClassicSkyPipeline> m_ClassicSkyPipeline;
     std::unique_ptr<LitPipeline> m_LitPipeline;
+    std::unique_ptr<VoxelLitPipeline> m_VoxelLitPipeline;
+    // ShadowPipeline is shared: it's a depth-only raster pass independent of
+    // which ShadowMap it renders into (see ShadowMap's ShadowSamplerMode) —
+    // no Voxel-specific variant needed.
     std::unique_ptr<ShadowPipeline> m_ShadowPipeline;
     std::unique_ptr<Texture3D> m_CloudNoiseTexture;
-    std::unique_ptr<ShadowMap> m_ShadowMap;
+    std::unique_ptr<ShadowMap> m_RealisticShadowMap;
+    std::unique_ptr<ShadowMap> m_VoxelShadowMap;
 
     // Starts empty; populated only via LoadScene() (see its doc comment
     // above). Each entity's MeshComponent owns its own Mesh shared_ptr (see
@@ -136,23 +165,38 @@ private:
     // declaration position here has no destruction-order implications.
     ScriptEngine m_ScriptEngine;
 
+    // LitUniformBufferObject's contents (view/proj/lightSpaceMatrix/
+    // sunDirectionAndAmbient) don't differ between Realistic and Voxel — only
+    // which ShadowMap is sampled back does — so both modes' lit descriptor
+    // sets bind the SAME buffer at binding 0; only binding 1 (the shadow
+    // sampler) differs between m_LitDescriptorSets and
+    // m_VoxelLitDescriptorSets.
     std::array<std::unique_ptr<Buffer>, kMaxFramesInFlight> m_LitUniformBuffers;
     VkDescriptorPool m_DescriptorPool = VK_NULL_HANDLE;
     std::array<VkDescriptorSet, kMaxFramesInFlight> m_LitDescriptorSets{};
+    std::array<VkDescriptorSet, kMaxFramesInFlight> m_VoxelLitDescriptorSets{};
 
     std::array<std::unique_ptr<Buffer>, kMaxFramesInFlight> m_SkyUniformBuffers;
     std::array<VkDescriptorSet, kMaxFramesInFlight> m_SkyDescriptorSets{};
+
+    std::array<std::unique_ptr<Buffer>, kMaxFramesInFlight> m_ClassicSkyUniformBuffers;
+    std::array<VkDescriptorSet, kMaxFramesInFlight> m_ClassicSkyDescriptorSets{};
 
     VkCommandPool m_CommandPool = VK_NULL_HANDLE;
     std::array<VkCommandBuffer, kMaxFramesInFlight> m_CommandBuffers{};
     std::array<VkSemaphore, kMaxFramesInFlight> m_ImageAvailableSemaphores{};
     std::array<VkFence, kMaxFramesInFlight> m_InFlightFences{};
     std::uint32_t m_CurrentFrame = 0;
-    // True only before the shadow map's very first render: its initial
-    // layout is UNDEFINED (see ShadowMap::CreateImage()), so the first
-    // frame's pre-shadow-pass barrier must transition FROM UNDEFINED rather
-    // than the SHADER_READ_ONLY_OPTIMAL every subsequent frame leaves it in.
-    bool m_FirstFrame = true;
+    // True only before EACH shadow map's own very first render: its initial
+    // layout is UNDEFINED (see ShadowMap::CreateImage()), so that map's first
+    // frame needs its pre-shadow-pass barrier to transition FROM UNDEFINED
+    // rather than the SHADER_READ_ONLY_OPTIMAL every subsequent render of it
+    // leaves it in. Tracked separately per map (not one shared flag) because
+    // a scene can switch modes — or a newly loaded scene can use the mode
+    // that hasn't rendered yet this session — well after the other mode's
+    // map has already had its first render.
+    bool m_RealisticShadowMapFirstFrame = true;
+    bool m_VoxelShadowMapFirstFrame = true;
 
     // No GLFWwindow/glfwGetTime() on this path — tracks its own elapsed-time
     // clock instead, used for the same cloud wind-scroll/sun-disk shader
@@ -166,12 +210,12 @@ private:
     Camera m_Camera;
 
     // Same defaults as Application's sky/cloud tunables (application.hpp) —
-    // no Qt panel exists yet to edit these. Also drives the lit scene's
-    // shadow-casting directional light (see GetSunDirection()/
-    // GetLightSpaceMatrix()) so the sun position and the shadow it casts
-    // stay visually consistent.
-    float m_SunElevationDegrees = 25.0f;
-    float m_SunAzimuthDegrees = 0.0f;
+    // no Qt panel exists yet to edit these. Realistic-mode-only (Voxel's
+    // ClassicSkyPipeline has no atmosphere/cloud raymarch at all). Sun
+    // elevation/azimuth and the lit scene's ambient strength moved to
+    // SceneLightingSettings in Phase 18 (see Scene::GetLightingSettings()) —
+    // they're scene-owned data now, not fields on this class, since
+    // different scenes can want a different sun position/lighting mode.
     float m_SkyExposure = 1.2f;
     int m_AtmospherePrimarySteps = 16;
     int m_AtmosphereSunSteps = 8;
@@ -181,10 +225,6 @@ private:
     float m_CloudWindDirectionDegrees = 0.0f;
     int m_CloudPrimarySteps = 64;
     int m_CloudSunShadowSteps = 8;
-
-    // Ambient term added to the lit scene's N.L diffuse term (see lit.frag)
-    // so shadowed/back faces read as dim rather than pure black.
-    float m_AmbientStrength = 0.15f;
 };
 
 } // namespace polyizon

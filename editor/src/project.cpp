@@ -67,8 +67,19 @@ json BuildDefaultSceneJson(const std::filesystem::path& spinScriptPath) {
     planeEntity["mesh"] = "models/plane.obj";
     planeEntity["material"] = { { "baseColor", json::array({ 0.3, 0.6, 0.25 }) } };
 
+    // Explicit rather than relying on SceneSerializer's "missing key"
+    // default — a brand-new project's scene should be self-describing (see
+    // the Phase 18 plan) even though these happen to match the same
+    // defaults SceneLightingSettings itself uses.
+    json lighting;
+    lighting["mode"] = "Realistic";
+    lighting["sunElevationDegrees"] = 25.0;
+    lighting["sunAzimuthDegrees"] = 0.0;
+    lighting["ambientStrength"] = 0.15;
+
     json root;
     root["entities"] = json::array({ cubeEntity, planeEntity });
+    root["lighting"] = lighting;
     return root;
 }
 
