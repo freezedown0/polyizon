@@ -40,6 +40,9 @@ public:
 public slots:
     void SetSelectedEntity(entt::entity entity);
 
+signals:
+    void EntityPresentationChanged();
+
 private:
     void Rebuild();
     void BuildTagSection(QFormLayout* form, entt::registry& registry);
@@ -47,8 +50,10 @@ private:
     void BuildMaterialSection(QVBoxLayout* container, entt::registry& registry);
     void BuildMeshSection(QVBoxLayout* container, entt::registry& registry);
     void BuildScriptSection(QVBoxLayout* container, entt::registry& registry);
+    void BuildDirectionalLightSection(QVBoxLayout* container, entt::registry& registry);
     void BuildPointLightSection(QVBoxLayout* container, entt::registry& registry);
     void BuildSpotLightSection(QVBoxLayout* container, entt::registry& registry);
+    void BuildAddComponentMenu(QVBoxLayout* container, entt::registry& registry);
 
     VulkanViewportWindow* m_ViewportWindow;
     entt::entity m_SelectedEntity = entt::null;

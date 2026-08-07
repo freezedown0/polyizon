@@ -26,7 +26,7 @@ struct SkyUniformBufferObject {
     // Stage 1's atmosphere-only shader.
     glm::vec4 cloudParams0; // x=cloudLayerBottom(km above planetR) y=cloudLayerTop z=coverage w=densityMultiplier
     glm::vec4 cloudParams1; // x=windSpeed y=windDirection(rad) z=forwardG w=backG (dual-lobe Henyey-Greenstein)
-    glm::vec4 cloudParams2; // x=powderStrength y=ambientStrength z=noiseUvScale w=reserved
+    glm::vec4 cloudParams2; // x=powderStrength y=ambientStrength z=noiseUvScale w=enabled
 
     glm::ivec4 stepCounts; // x=atmosphere primary steps y=atmosphere sun steps z=cloud primary steps w=cloud shadow steps
 };

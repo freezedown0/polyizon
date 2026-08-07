@@ -1,6 +1,8 @@
 #pragma once
 
 #include "polyizon/scene/lighting_settings.hpp"
+#include "polyizon/scene/components.hpp"
+#include "polyizon/scene/entity_uuid.hpp"
 
 #include <entt/entt.hpp>
 
@@ -14,13 +16,16 @@ namespace polyizon {
 // there's an authored scene worth persisting/editing (see the Phase 15
 // plan's scope notes).
 //
-// Also owns scene-level (not per-entity) lighting settings (see
-// lighting_settings.hpp) — Phase 18 moved these here from being
-// EditorViewportRenderer's own hardcoded fields, so different scenes can
-// have different sun positions/lighting modes.
+// Also owns scene-level (not per-entity) environment settings so different
+// scenes can have different sky and cloud authoring.
 class Scene {
 public:
-    entt::entity CreateEntity() { return m_Registry.create(); }
+    entt::entity CreateEntity() {
+        const entt::entity entity = m_Registry.create();
+        m_Registry.emplace<IdentityComponent>(entity, GenerateEntityUuid());
+        m_Registry.emplace<EntityMetadataComponent>(entity);
+        return entity;
+    }
 
     entt::registry& GetRegistry() noexcept { return m_Registry; }
     const entt::registry& GetRegistry() const noexcept { return m_Registry; }

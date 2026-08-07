@@ -3,6 +3,7 @@
 #include "vulkan_viewport_window.hpp"
 
 #include "editor_viewport_renderer.hpp"
+#include "component_icons.hpp"
 
 #include "polyizon/assets/mesh_import.hpp"
 #include "polyizon/scene/components.hpp"
@@ -12,6 +13,7 @@
 #include <Windows.h>
 
 #include <QColorDialog>
+#include <QCheckBox>
 #include <QDoubleSpinBox>
 #include <QFileDialog>
 #include <QFormLayout>
@@ -19,8 +21,10 @@
 #include <QLabel>
 #include <QLineEdit>
 #include <QMessageBox>
+#include <QMenu>
 #include <QPushButton>
 #include <QTimer>
+#include <QToolButton>
 #include <QVBoxLayout>
 
 #include <filesystem>
@@ -61,7 +65,8 @@ std::string ToStoredAssetPath(const std::filesystem::path& absolutePath) {
 // leaving it empty but reusable — used by InspectorPanel::Rebuild() to
 // clear the previous entity's form before building the new one.
 void ClearLayout(QLayout* layout) {
-    while (QLayoutItem* item = layout->takeAt(0)) {
+    while (layout->count() > 0) {
+        QLayoutItem* item = layout->takeAt(0);
         if (QWidget* widget = item->widget()) {
             widget->deleteLater();
         } else if (QLayout* childLayout = item->layout()) {
@@ -78,13 +83,34 @@ void ClearLayout(QLayout* layout) {
     }
 }
 
+QWidget* CreateSectionHeading(QWidget* parent, ComponentIconKind icon, const QString& title) {
+    auto* heading = new QWidget(parent);
+    heading->setObjectName("ComponentHeading");
+    auto* layout = new QHBoxLayout(heading);
+    layout->setContentsMargins(2, 10, 2, 4);
+    layout->setSpacing(7);
+    auto* iconLabel = new QLabel(heading);
+    iconLabel->setPixmap(GetComponentIcon(icon, 17).pixmap(17, 17));
+    auto* titleLabel = new QLabel(title, heading);
+    titleLabel->setObjectName("SectionHeadingText");
+    layout->addWidget(iconLabel);
+    layout->addWidget(titleLabel);
+    layout->addStretch();
+    return heading;
+}
+
 } // namespace
 
 InspectorPanel::InspectorPanel(VulkanViewportWindow* viewportWindow, QWidget* parent)
     : QWidget(parent), m_ViewportWindow(viewportWindow) {
     m_RootLayout = new QVBoxLayout(this);
-    m_RootLayout->setContentsMargins(4, 4, 4, 4);
-    m_RootLayout->addWidget(new QLabel("No entity selected", this));
+    m_RootLayout->setContentsMargins(10, 10, 10, 10);
+    m_RootLayout->setSpacing(8);
+    auto* emptyLabel = new QLabel("Select an entity to edit its properties", this);
+    emptyLabel->setObjectName("EmptyState");
+    emptyLabel->setAlignment(Qt::AlignCenter);
+    emptyLabel->setWordWrap(true);
+    m_RootLayout->addWidget(emptyLabel);
     m_RootLayout->addStretch();
 }
 
@@ -98,14 +124,22 @@ void InspectorPanel::Rebuild() {
 
     polyizon::EditorViewportRenderer* renderer = m_ViewportWindow->GetRenderer();
     if (!renderer || m_SelectedEntity == entt::null) {
-        m_RootLayout->addWidget(new QLabel("No entity selected", this));
+        auto* emptyLabel = new QLabel("Select an entity to edit its properties", this);
+        emptyLabel->setObjectName("EmptyState");
+        emptyLabel->setAlignment(Qt::AlignCenter);
+        emptyLabel->setWordWrap(true);
+        m_RootLayout->addWidget(emptyLabel);
         m_RootLayout->addStretch();
         return;
     }
 
     entt::registry& registry = renderer->GetScene().GetRegistry();
     if (!registry.valid(m_SelectedEntity)) {
-        m_RootLayout->addWidget(new QLabel("No entity selected", this));
+        auto* emptyLabel = new QLabel("The selected entity is no longer available", this);
+        emptyLabel->setObjectName("EmptyState");
+        emptyLabel->setAlignment(Qt::AlignCenter);
+        emptyLabel->setWordWrap(true);
+        m_RootLayout->addWidget(emptyLabel);
         m_RootLayout->addStretch();
         return;
     }
@@ -115,11 +149,26 @@ void InspectorPanel::Rebuild() {
     BuildTransformSection(form, registry);
     m_RootLayout->addLayout(form);
 
-    BuildMaterialSection(m_RootLayout, registry);
-    BuildMeshSection(m_RootLayout, registry);
-    BuildScriptSection(m_RootLayout, registry);
-    BuildPointLightSection(m_RootLayout, registry);
-    BuildSpotLightSection(m_RootLayout, registry);
+    if (registry.all_of<polyizon::MaterialComponent>(m_SelectedEntity)) {
+        BuildMaterialSection(m_RootLayout, registry);
+    }
+    if (registry.all_of<polyizon::MeshComponent>(m_SelectedEntity)) {
+        BuildMeshSection(m_RootLayout, registry);
+    }
+    if (registry.all_of<polyizon::ScriptComponent>(m_SelectedEntity)) {
+        BuildScriptSection(m_RootLayout, registry);
+    }
+    if (registry.all_of<polyizon::DirectionalLightComponent>(m_SelectedEntity)) {
+        BuildDirectionalLightSection(m_RootLayout, registry);
+    }
+    if (registry.all_of<polyizon::PointLightComponent>(m_SelectedEntity)) {
+        BuildPointLightSection(m_RootLayout, registry);
+    }
+    if (registry.all_of<polyizon::SpotLightComponent>(m_SelectedEntity)) {
+        BuildSpotLightSection(m_RootLayout, registry);
+    }
+
+    BuildAddComponentMenu(m_RootLayout, registry);
 
     m_RootLayout->addStretch();
 }
@@ -136,8 +185,41 @@ void InspectorPanel::BuildTagSection(QFormLayout* form, entt::registry& registry
         m_ViewportWindow->MaybeWarnEditDuringPlay(this);
         renderer->GetScene().GetRegistry().get<polyizon::TagComponent>(m_SelectedEntity).name =
             nameEdit->text().toStdString();
+        emit EntityPresentationChanged();
     });
     form->addRow("Name", nameEdit);
+
+    if (const auto* identity = registry.try_get<polyizon::IdentityComponent>(m_SelectedEntity)) {
+        auto* idLabel = new QLabel(QString::fromStdString(identity->uuid), this);
+        idLabel->setObjectName("EntityIdLabel");
+        idLabel->setTextInteractionFlags(Qt::TextSelectableByMouse);
+        idLabel->setToolTip("Stable scene identity used by prefabs, references, and baked data");
+        form->addRow("Entity ID", idLabel);
+    }
+
+    if (auto* metadata = registry.try_get<polyizon::EntityMetadataComponent>(m_SelectedEntity)) {
+        auto* enabled = new QCheckBox("Active", this);
+        enabled->setChecked(metadata->enabled);
+        enabled->setToolTip("Inactive entities do not render, light, or run scripts");
+        connect(enabled, &QCheckBox::toggled, this, [this](bool checked) {
+            auto* renderer = m_ViewportWindow->GetRenderer();
+            if (!renderer || !renderer->GetScene().GetRegistry().valid(m_SelectedEntity)) return;
+            renderer->GetScene().GetRegistry().get<polyizon::EntityMetadataComponent>(m_SelectedEntity).enabled = checked;
+            emit EntityPresentationChanged();
+        });
+        form->addRow("State", enabled);
+
+        auto* staticLighting = new QCheckBox("Contribute to baked lighting", this);
+        staticLighting->setChecked(metadata->staticForLighting);
+        staticLighting->setToolTip("Include this entity when building the light-bake scene");
+        connect(staticLighting, &QCheckBox::toggled, this, [this](bool checked) {
+            auto* renderer = m_ViewportWindow->GetRenderer();
+            if (!renderer || !renderer->GetScene().GetRegistry().valid(m_SelectedEntity)) return;
+            renderer->GetScene().GetRegistry().get<polyizon::EntityMetadataComponent>(m_SelectedEntity).staticForLighting = checked;
+            emit EntityPresentationChanged();
+        });
+        form->addRow("Lighting", staticLighting);
+    }
 }
 
 void InspectorPanel::BuildTransformSection(QFormLayout* form, entt::registry& registry) {
@@ -173,7 +255,7 @@ void InspectorPanel::BuildTransformSection(QFormLayout* form, entt::registry& re
 }
 
 void InspectorPanel::BuildMaterialSection(QVBoxLayout* container, entt::registry& registry) {
-    container->addWidget(new QLabel("<b>Material</b>", this));
+    container->addWidget(CreateSectionHeading(this, ComponentIconKind::Material, "Material"));
 
     if (auto* material = registry.try_get<polyizon::MaterialComponent>(m_SelectedEntity)) {
         auto* rowLayout = new QHBoxLayout();
@@ -220,6 +302,69 @@ void InspectorPanel::BuildMaterialSection(QVBoxLayout* container, entt::registry
         });
         rowLayout->addWidget(removeButton);
         container->addLayout(rowLayout);
+
+        auto* materialForm = new QFormLayout();
+        auto* metallicSpin = new QDoubleSpinBox(this);
+        metallicSpin->setRange(0.0, 1.0);
+        metallicSpin->setDecimals(3);
+        metallicSpin->setSingleStep(0.05);
+        metallicSpin->setValue(material->metallic);
+        connect(metallicSpin, qOverload<double>(&QDoubleSpinBox::valueChanged), this, [this](double value) {
+            auto* renderer = m_ViewportWindow->GetRenderer();
+            if (renderer && renderer->GetScene().GetRegistry().valid(m_SelectedEntity)) {
+                renderer->GetScene().GetRegistry().get<polyizon::MaterialComponent>(m_SelectedEntity).metallic =
+                    static_cast<float>(value);
+            }
+        });
+        materialForm->addRow("Metallic", metallicSpin);
+
+        auto* roughnessSpin = new QDoubleSpinBox(this);
+        roughnessSpin->setRange(0.045, 1.0);
+        roughnessSpin->setDecimals(3);
+        roughnessSpin->setSingleStep(0.05);
+        roughnessSpin->setValue(material->roughness);
+        connect(roughnessSpin, qOverload<double>(&QDoubleSpinBox::valueChanged), this, [this](double value) {
+            auto* renderer = m_ViewportWindow->GetRenderer();
+            if (renderer && renderer->GetScene().GetRegistry().valid(m_SelectedEntity)) {
+                renderer->GetScene().GetRegistry().get<polyizon::MaterialComponent>(m_SelectedEntity).roughness =
+                    static_cast<float>(value);
+            }
+        });
+        materialForm->addRow("Roughness", roughnessSpin);
+
+        const QColor currentEmission(
+            static_cast<int>(material->emissiveColor.r * 255.0f),
+            static_cast<int>(material->emissiveColor.g * 255.0f),
+            static_cast<int>(material->emissiveColor.b * 255.0f));
+        auto* emissiveColorButton = new QPushButton(this);
+        emissiveColorButton->setFixedWidth(48);
+        emissiveColorButton->setStyleSheet(QString("background-color: %1;").arg(currentEmission.name()));
+        connect(emissiveColorButton, &QPushButton::clicked, this, [this, emissiveColorButton]() {
+            auto* renderer = m_ViewportWindow->GetRenderer();
+            if (!renderer || !renderer->GetScene().GetRegistry().valid(m_SelectedEntity)) return;
+            auto& live = renderer->GetScene().GetRegistry().get<polyizon::MaterialComponent>(m_SelectedEntity);
+            const QColor existing = QColor::fromRgbF(live.emissiveColor.r, live.emissiveColor.g, live.emissiveColor.b);
+            const QColor chosen = QColorDialog::getColor(existing, this, "Emission Color");
+            if (!chosen.isValid()) return;
+            live.emissiveColor = glm::vec3(chosen.redF(), chosen.greenF(), chosen.blueF());
+            emissiveColorButton->setStyleSheet(QString("background-color: %1;").arg(chosen.name()));
+        });
+        materialForm->addRow("Emission Color", emissiveColorButton);
+
+        auto* emissiveSpin = new QDoubleSpinBox(this);
+        emissiveSpin->setRange(0.0, 100.0);
+        emissiveSpin->setDecimals(2);
+        emissiveSpin->setSingleStep(0.1);
+        emissiveSpin->setValue(material->emissiveIntensity);
+        connect(emissiveSpin, qOverload<double>(&QDoubleSpinBox::valueChanged), this, [this](double value) {
+            auto* renderer = m_ViewportWindow->GetRenderer();
+            if (renderer && renderer->GetScene().GetRegistry().valid(m_SelectedEntity)) {
+                renderer->GetScene().GetRegistry().get<polyizon::MaterialComponent>(m_SelectedEntity).emissiveIntensity =
+                    static_cast<float>(value);
+            }
+        });
+        materialForm->addRow("Emission Strength", emissiveSpin);
+        container->addLayout(materialForm);
     } else {
         auto* addButton = new QPushButton("Add Material", this);
         connect(addButton, &QPushButton::clicked, this, [this]() {
@@ -236,7 +381,7 @@ void InspectorPanel::BuildMaterialSection(QVBoxLayout* container, entt::registry
 }
 
 void InspectorPanel::BuildMeshSection(QVBoxLayout* container, entt::registry& registry) {
-    container->addWidget(new QLabel("<b>Mesh</b>", this));
+    container->addWidget(CreateSectionHeading(this, ComponentIconKind::Mesh, "Mesh"));
 
     if (auto* mesh = registry.try_get<polyizon::MeshComponent>(m_SelectedEntity)) {
         auto* pathLabel = new QLabel(QString::fromStdString(mesh->sourcePath), this);
@@ -315,7 +460,7 @@ void InspectorPanel::BuildMeshSection(QVBoxLayout* container, entt::registry& re
 }
 
 void InspectorPanel::BuildScriptSection(QVBoxLayout* container, entt::registry& registry) {
-    container->addWidget(new QLabel("<b>Script</b>", this));
+    container->addWidget(CreateSectionHeading(this, ComponentIconKind::Script, "Script (Lua compatibility)"));
 
     if (auto* script = registry.try_get<polyizon::ScriptComponent>(m_SelectedEntity)) {
         auto* pathEdit = new QLineEdit(QString::fromStdString(script->scriptPath), this);
@@ -382,11 +527,94 @@ void InspectorPanel::BuildScriptSection(QVBoxLayout* container, entt::registry& 
     }
 }
 
+void InspectorPanel::BuildDirectionalLightSection(QVBoxLayout* container, entt::registry& registry) {
+    container->addWidget(CreateSectionHeading(this, ComponentIconKind::DirectionalLight, "Directional Light"));
+
+    auto* light = registry.try_get<polyizon::DirectionalLightComponent>(m_SelectedEntity);
+    if (!light) {
+        return;
+    }
+
+    auto* form = new QFormLayout();
+    auto* enabled = new QCheckBox("Enabled", this);
+    enabled->setChecked(light->enabled);
+    connect(enabled, &QCheckBox::toggled, this, [this](bool checked) {
+        auto* renderer = m_ViewportWindow->GetRenderer();
+        if (renderer && renderer->GetScene().GetRegistry().valid(m_SelectedEntity)) {
+            renderer->GetScene().GetRegistry().get<polyizon::DirectionalLightComponent>(m_SelectedEntity).enabled = checked;
+        }
+    });
+    form->addRow("State", enabled);
+
+    const QColor current(
+        static_cast<int>(light->color.r * 255.0f),
+        static_cast<int>(light->color.g * 255.0f),
+        static_cast<int>(light->color.b * 255.0f));
+    auto* colorButton = new QPushButton(this);
+    colorButton->setFixedWidth(48);
+    colorButton->setStyleSheet(QString("background-color: %1;").arg(current.name()));
+    connect(colorButton, &QPushButton::clicked, this, [this, colorButton]() {
+        auto* renderer = m_ViewportWindow->GetRenderer();
+        if (!renderer || !renderer->GetScene().GetRegistry().valid(m_SelectedEntity)) return;
+        auto& live = renderer->GetScene().GetRegistry().get<polyizon::DirectionalLightComponent>(m_SelectedEntity);
+        const QColor existing = QColor::fromRgbF(live.color.r, live.color.g, live.color.b);
+        const QColor chosen = QColorDialog::getColor(existing, this, "Directional Light Color");
+        if (!chosen.isValid()) return;
+        live.color = glm::vec3(chosen.redF(), chosen.greenF(), chosen.blueF());
+        colorButton->setStyleSheet(QString("background-color: %1;").arg(chosen.name()));
+    });
+    form->addRow("Color", colorButton);
+
+    auto* intensity = new QDoubleSpinBox(this);
+    intensity->setRange(0.0, 100000.0);
+    intensity->setDecimals(2);
+    intensity->setSingleStep(0.1);
+    intensity->setValue(light->intensity);
+    connect(intensity, qOverload<double>(&QDoubleSpinBox::valueChanged), this, [this](double value) {
+        auto* renderer = m_ViewportWindow->GetRenderer();
+        if (renderer && renderer->GetScene().GetRegistry().valid(m_SelectedEntity)) {
+            renderer->GetScene().GetRegistry().get<polyizon::DirectionalLightComponent>(m_SelectedEntity).intensity =
+                static_cast<float>(value);
+        }
+    });
+    form->addRow("Intensity", intensity);
+
+    auto* shadows = new QCheckBox("Cast real-time shadows", this);
+    shadows->setChecked(light->castsShadows);
+    connect(shadows, &QCheckBox::toggled, this, [this](bool checked) {
+        auto* renderer = m_ViewportWindow->GetRenderer();
+        if (renderer && renderer->GetScene().GetRegistry().valid(m_SelectedEntity)) {
+            renderer->GetScene().GetRegistry().get<polyizon::DirectionalLightComponent>(m_SelectedEntity).castsShadows = checked;
+        }
+    });
+    form->addRow("Shadows", shadows);
+    container->addLayout(form);
+
+    auto* removeButton = new QPushButton("Remove Directional Light", this);
+    connect(removeButton, &QPushButton::clicked, this, [this]() {
+        auto* renderer = m_ViewportWindow->GetRenderer();
+        if (!renderer || !renderer->GetScene().GetRegistry().valid(m_SelectedEntity)) return;
+        renderer->GetScene().GetRegistry().remove<polyizon::DirectionalLightComponent>(m_SelectedEntity);
+        QTimer::singleShot(0, this, &InspectorPanel::Rebuild);
+    });
+    container->addWidget(removeButton);
+}
+
 void InspectorPanel::BuildPointLightSection(QVBoxLayout* container, entt::registry& registry) {
-    container->addWidget(new QLabel("<b>Point Light</b>", this));
+    container->addWidget(CreateSectionHeading(this, ComponentIconKind::PointLight, "Point Light"));
 
     if (auto* light = registry.try_get<polyizon::PointLightComponent>(m_SelectedEntity)) {
         auto* form = new QFormLayout();
+
+        auto* enabled = new QCheckBox("Enabled", this);
+        enabled->setChecked(light->enabled);
+        connect(enabled, &QCheckBox::toggled, this, [this](bool checked) {
+            auto* renderer = m_ViewportWindow->GetRenderer();
+            if (renderer && renderer->GetScene().GetRegistry().valid(m_SelectedEntity)) {
+                renderer->GetScene().GetRegistry().get<polyizon::PointLightComponent>(m_SelectedEntity).enabled = checked;
+            }
+        });
+        form->addRow("State", enabled);
 
         const QColor current(
             static_cast<int>(light->color.r * 255.0f),
@@ -479,10 +707,20 @@ void InspectorPanel::BuildPointLightSection(QVBoxLayout* container, entt::regist
 }
 
 void InspectorPanel::BuildSpotLightSection(QVBoxLayout* container, entt::registry& registry) {
-    container->addWidget(new QLabel("<b>Spot Light</b>", this));
+    container->addWidget(CreateSectionHeading(this, ComponentIconKind::SpotLight, "Spot Light"));
 
     if (auto* light = registry.try_get<polyizon::SpotLightComponent>(m_SelectedEntity)) {
         auto* form = new QFormLayout();
+
+        auto* enabled = new QCheckBox("Enabled", this);
+        enabled->setChecked(light->enabled);
+        connect(enabled, &QCheckBox::toggled, this, [this](bool checked) {
+            auto* renderer = m_ViewportWindow->GetRenderer();
+            if (renderer && renderer->GetScene().GetRegistry().valid(m_SelectedEntity)) {
+                renderer->GetScene().GetRegistry().get<polyizon::SpotLightComponent>(m_SelectedEntity).enabled = checked;
+            }
+        });
+        form->addRow("State", enabled);
 
         const QColor current(
             static_cast<int>(light->color.r * 255.0f),
@@ -604,4 +842,89 @@ void InspectorPanel::BuildSpotLightSection(QVBoxLayout* container, entt::registr
         });
         container->addWidget(addButton);
     }
+}
+
+void InspectorPanel::BuildAddComponentMenu(QVBoxLayout* container, entt::registry& registry) {
+    auto* button = new QToolButton(this);
+    button->setText("+  Add Component");
+    button->setObjectName("AddComponentButton");
+    button->setPopupMode(QToolButton::InstantPopup);
+    auto* menu = new QMenu(button);
+
+    const auto rebuildSoon = [this]() { QTimer::singleShot(0, this, &InspectorPanel::Rebuild); };
+
+    if (!registry.all_of<polyizon::MaterialComponent>(m_SelectedEntity)) {
+        QAction* action = menu->addAction(GetComponentIcon(ComponentIconKind::Material), "Material");
+        connect(action, &QAction::triggered, this, [this, rebuildSoon]() {
+            auto* renderer = m_ViewportWindow->GetRenderer();
+            if (!renderer || !renderer->GetScene().GetRegistry().valid(m_SelectedEntity)) return;
+            renderer->GetScene().GetRegistry().emplace<polyizon::MaterialComponent>(m_SelectedEntity);
+            rebuildSoon();
+        });
+    }
+
+    if (!registry.all_of<polyizon::MeshComponent>(m_SelectedEntity)) {
+        QAction* action = menu->addAction(GetComponentIcon(ComponentIconKind::Mesh), "Mesh Renderer...");
+        connect(action, &QAction::triggered, this, [this, rebuildSoon]() {
+            const QString filePath = QFileDialog::getOpenFileName(this, "Choose Mesh", QString(), "Meshes (*.obj *.fbx *.gltf *.glb)");
+            if (filePath.isEmpty()) return;
+            auto* renderer = m_ViewportWindow->GetRenderer();
+            if (!renderer || !renderer->GetScene().GetRegistry().valid(m_SelectedEntity)) return;
+            try {
+                const std::filesystem::path chosen(filePath.toStdWString());
+                auto mesh = LoadMesh(renderer->GetVulkanContext(), chosen);
+                renderer->GetScene().GetRegistry().emplace<polyizon::MeshComponent>(
+                    m_SelectedEntity, std::move(mesh), ToStoredAssetPath(chosen));
+                rebuildSoon();
+            } catch (const std::exception& error) {
+                QMessageBox::critical(this, "Failed to load mesh", error.what());
+            }
+        });
+    }
+
+    if (!registry.all_of<polyizon::ScriptComponent>(m_SelectedEntity)) {
+        QAction* action = menu->addAction(GetComponentIcon(ComponentIconKind::Script), "Lua Script (Legacy)...");
+        connect(action, &QAction::triggered, this, [this, rebuildSoon]() {
+            const QString filePath = QFileDialog::getOpenFileName(this, "Choose Legacy Lua Script", QString(), "Lua scripts (*.lua)");
+            if (filePath.isEmpty()) return;
+            auto* renderer = m_ViewportWindow->GetRenderer();
+            if (!renderer || !renderer->GetScene().GetRegistry().valid(m_SelectedEntity)) return;
+            renderer->GetScene().GetRegistry().emplace<polyizon::ScriptComponent>(
+                m_SelectedEntity, ToStoredAssetPath(std::filesystem::path(filePath.toStdWString())));
+            rebuildSoon();
+        });
+    }
+
+    menu->addSeparator();
+    if (!registry.all_of<polyizon::DirectionalLightComponent>(m_SelectedEntity)) {
+        QAction* action = menu->addAction(GetComponentIcon(ComponentIconKind::DirectionalLight), "Directional Light");
+        connect(action, &QAction::triggered, this, [this, rebuildSoon]() {
+            auto* renderer = m_ViewportWindow->GetRenderer();
+            if (!renderer || !renderer->GetScene().GetRegistry().valid(m_SelectedEntity)) return;
+            renderer->GetScene().GetRegistry().emplace<polyizon::DirectionalLightComponent>(m_SelectedEntity);
+            rebuildSoon();
+        });
+    }
+    if (!registry.all_of<polyizon::PointLightComponent>(m_SelectedEntity)) {
+        QAction* action = menu->addAction(GetComponentIcon(ComponentIconKind::PointLight), "Point Light");
+        connect(action, &QAction::triggered, this, [this, rebuildSoon]() {
+            auto* renderer = m_ViewportWindow->GetRenderer();
+            if (!renderer || !renderer->GetScene().GetRegistry().valid(m_SelectedEntity)) return;
+            renderer->GetScene().GetRegistry().emplace<polyizon::PointLightComponent>(m_SelectedEntity);
+            rebuildSoon();
+        });
+    }
+    if (!registry.all_of<polyizon::SpotLightComponent>(m_SelectedEntity)) {
+        QAction* action = menu->addAction(GetComponentIcon(ComponentIconKind::SpotLight), "Spot Light");
+        connect(action, &QAction::triggered, this, [this, rebuildSoon]() {
+            auto* renderer = m_ViewportWindow->GetRenderer();
+            if (!renderer || !renderer->GetScene().GetRegistry().valid(m_SelectedEntity)) return;
+            renderer->GetScene().GetRegistry().emplace<polyizon::SpotLightComponent>(m_SelectedEntity);
+            rebuildSoon();
+        });
+    }
+
+    button->setMenu(menu);
+    button->setEnabled(!menu->actions().isEmpty());
+    container->addWidget(button);
 }

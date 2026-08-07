@@ -3,13 +3,12 @@
 #include "polyizon/scene/scene.hpp"
 #include "polyizon/scripting/script_engine.hpp"
 #include "polyizon/vulkan/buffer.hpp"
-#include "polyizon/vulkan/classic_sky_pipeline.hpp"
 #include "polyizon/vulkan/lit_pipeline.hpp"
+#include "polyizon/vulkan/image_state_tracker.hpp"
 #include "polyizon/vulkan/shadow_map.hpp"
 #include "polyizon/vulkan/shadow_pipeline.hpp"
 #include "polyizon/vulkan/sky_pipeline.hpp"
 #include "polyizon/vulkan/texture3d.hpp"
-#include "polyizon/vulkan/voxel_lit_pipeline.hpp"
 
 #include <glm/glm.hpp>
 
@@ -22,11 +21,11 @@ namespace polyizon {
 
 class VulkanContext;
 
-// Renders a loaded project's Scene (Realistic or Voxel lighting, shadows,
-// point/spot lights) and drives its Lua scripts every frame — the rendering
+// Renders a loaded project's Scene with the realistic sky, PBR lighting,
+// shadows, and authored lights, and drives its Lua scripts every frame — the rendering
 // half of a "compiled game" (see Application's project mode / the editor's
 // Build Game export, Phase 20). A sibling to EditorViewportRenderer (same
-// Sky/ClassicSky/Lit/VoxelLit/Shadow pipeline set, same per-frame UBO
+// Sky/Lit/Shadow pipeline set, same per-frame UBO
 // population, same shadow-pass/main-pass structure) rather than a shared
 // base class with it — see the Phase 14 plan's "duplication over a shared
 // RenderCore" precedent. Unlike EditorViewportRenderer, this class does NOT
@@ -78,51 +77,42 @@ private:
     void UpdateLitUniformBuffer(std::uint32_t frameIndex, const glm::mat4& view, const glm::mat4& proj);
     void UpdateSkyUniformBuffer(
         std::uint32_t frameIndex, const glm::mat4& view, const glm::mat4& proj, float time);
-    void UpdateClassicSkyUniformBuffer(std::uint32_t frameIndex, const glm::mat4& view, const glm::mat4& proj);
     void RenderShadowPass(VkCommandBuffer cmd);
     void RenderMainPass(VkCommandBuffer cmd, VkImage colorImage, VkImageView colorImageView,
         VkImage depthImage, VkImageView depthImageView, VkExtent2D extent);
     void DrawLitEntities(VkCommandBuffer cmd, VkPipelineLayout pipelineLayout);
     glm::vec3 GetSunDirection() const;
+    glm::vec3 GetDirectionalLightDirection() const;
+    glm::vec4 GetDirectionalLightColorAndIntensity() const;
+    bool GetDirectionalLightCastsShadows() const;
     glm::mat4 GetLightSpaceMatrix() const;
 
     // Matches Application's/EditorViewportRenderer's own constant of the
     // same name/value — this class's per-frame-in-flight arrays are sized to
     // it, and RecordFrame()'s frameIndex parameter must stay under it.
     static constexpr std::uint32_t kMaxFramesInFlight = 2;
-    static constexpr std::uint32_t kRealisticShadowMapResolution = 2048;
-    // Deliberately tiny — see ShadowSamplerMode::PlainNearest and
-    // voxel_lit.frag's kVoxelDepthSlices for how this becomes a genuinely
-    // blocky "4x4x4" shadow rather than a low-res-but-smooth one.
-    static constexpr std::uint32_t kVoxelShadowMapResolution = 4;
+    static constexpr std::uint32_t kShadowMapResolution = 2048;
 
     VulkanContext& m_Context;
 
     std::unique_ptr<SkyPipeline> m_SkyPipeline;
-    std::unique_ptr<ClassicSkyPipeline> m_ClassicSkyPipeline;
     std::unique_ptr<LitPipeline> m_LitPipeline;
-    std::unique_ptr<VoxelLitPipeline> m_VoxelLitPipeline;
     std::unique_ptr<ShadowPipeline> m_ShadowPipeline;
     std::unique_ptr<Texture3D> m_CloudNoiseTexture;
-    std::unique_ptr<ShadowMap> m_RealisticShadowMap;
-    std::unique_ptr<ShadowMap> m_VoxelShadowMap;
+    std::unique_ptr<ShadowMap> m_ShadowMap;
 
     Scene m_Scene;
     ScriptEngine m_ScriptEngine;
 
     std::array<std::unique_ptr<Buffer>, kMaxFramesInFlight> m_LitUniformBuffers;
+    std::array<std::unique_ptr<Buffer>, kMaxFramesInFlight> m_LocalLightBuffers;
+    int m_LastDroppedLightCount = 0;
     VkDescriptorPool m_DescriptorPool = VK_NULL_HANDLE;
     std::array<VkDescriptorSet, kMaxFramesInFlight> m_LitDescriptorSets{};
-    std::array<VkDescriptorSet, kMaxFramesInFlight> m_VoxelLitDescriptorSets{};
     std::array<std::unique_ptr<Buffer>, kMaxFramesInFlight> m_SkyUniformBuffers;
     std::array<VkDescriptorSet, kMaxFramesInFlight> m_SkyDescriptorSets{};
-    std::array<std::unique_ptr<Buffer>, kMaxFramesInFlight> m_ClassicSkyUniformBuffers;
-    std::array<VkDescriptorSet, kMaxFramesInFlight> m_ClassicSkyDescriptorSets{};
 
-    // Same "first render transitions FROM UNDEFINED" reasoning as
-    // EditorViewportRenderer's identical pair of flags.
-    bool m_RealisticShadowMapFirstFrame = true;
-    bool m_VoxelShadowMapFirstFrame = true;
+    ImageStateTracker m_ImageStates;
 
     // Set by RecordFrame() at the top of each call, read by RenderMainPass()/
     // DrawLitEntities() to pick which frame-in-flight's descriptor sets to

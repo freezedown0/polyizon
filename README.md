@@ -1,36 +1,89 @@
-# Polyizon
+<p align="center">
+  <img src="temporaryassets/Horizontal%20Lockup.png" alt="Polyizon" width="640">
+</p>
 
-A C++20 / Vulkan 1.3 3D engine: a Qt-based editor (scene hierarchy, inspector, content browser, console, Play/Pause/Stop) and a standalone GLFW game client, sharing one `core` static library — EnTT for the scene graph, Assimp for mesh import, Lua (via sol2) for scripting, nlohmann/json for scene and project serialization.
+<p align="center">
+  <strong>POLYIZON ENGINE 2 - PREVIEW</strong><br>
+  A modern, realistic Vulkan engine and editor in active development.
+</p>
 
-## Features
+> [!IMPORTANT]
+> This branch is a development preview. Scene serialization is backward-compatible,
+> but rendering APIs and editor workflows may still change before the stable Engine 2 release.
 
-- Vulkan 1.3 dynamic rendering, no legacy render passes
-- Realistic (raymarched atmosphere + volumetric clouds, PCF shadows) and Voxel (flat sky, blocky 4x4x4 shadow grid) lighting modes, switchable per scene
-- Directional, point, and spot lights
-- EnTT-based scenes with Assimp mesh import (.obj/.fbx/...), JSON serialization
-- Lua scripting per-entity via sol2
-- Play/Pause/Stop with scene snapshot/restore, so testing a scene never permanently mutates it
-- Move/Rotate viewport gizmos for manipulating entities directly with the mouse
-- Content Browser with file import
-- Build Game: exports the currently open project into a standalone, self-contained executable that runs without the editor
+## What is Polyizon?
 
-## Building
+Polyizon is a C++20 game engine built around Vulkan 1.3. It includes a Qt-based
+editor and a standalone GLFW client that share the same scene, lighting, material,
+and rendering code.
 
-Requires CMake 3.25+, a C++20 compiler (MSVC), the Vulkan SDK, and vcpkg for dependencies (Qt6, GLFW, Assimp, Lua, sol2, nlohmann-json, EnTT, glm, ImGui, VulkanMemoryAllocator). Configure and build with the provided CMake presets:
+The Engine 2 direction replaces the original voxel-style prototype with one
+realistic rendering path and a cleaner authoring experience.
 
-```bash
+## Preview highlights
+
+- Modern dark editor with Hierarchy, Inspector, Content Browser, Console, and viewport tools
+- Project-aware `.scene` workflow with versioned serialization and stable entity IDs
+- Physically based metallic/roughness materials with emissive support
+- Directional, point, and spot lights with Realtime, Mixed, and Baked mobility
+- PCF directional shadows and editable Sky Environment
+- Optional raymarched volumetric cloud layer
+- Shared Render Graph frame structure for Editor and Client
+- Automatic Vulkan image-layout and synchronization tracking
+- Forward+ GPU light-buffer foundation for up to 1,024 active local lights
+- Play, Pause, and Stop with scene snapshot restoration
+- Standalone project builds from the Editor
+
+## Engine 2 status
+
+| Area | Preview status |
+| --- | --- |
+| Authoring and PBR foundation | In progress |
+| Shared Render Graph | Partially implemented |
+| Automatic Vulkan image transitions | Implemented in the scene renderers |
+| Forward+ lighting | GPU light buffers implemented; compute tile culling in progress |
+| Light baking | Planned |
+| C# scripting API | Planned; Lua remains as a compatibility layer |
+| Production diagnostics | Planned |
+
+The detailed milestone list lives in
+[`docs/ENGINE_2_ROADMAP.md`](docs/ENGINE_2_ROADMAP.md).
+
+## Building on Windows
+
+Requirements:
+
+- CMake 3.25 or newer
+- A C++20-capable MSVC toolchain
+- Vulkan SDK
+- vcpkg dependencies configured for the included preset
+
+```powershell
 cmake --preset windows-ninja
 cmake --build build/windows-ninja
 ```
 
-This produces `polyizon_editor.exe` (the editor) and `polyizon.exe` (the standalone game client) under `build/windows-ninja/bin/`.
+The build produces:
+
+- `build/windows-ninja/bin/polyizon_editor.exe` - Polyizon Editor
+- `build/windows-ninja/bin/polyizon.exe` - standalone client
+
+## Current technology
+
+- Vulkan 1.3 dynamic rendering and synchronization2
+- Qt 6 editor UI and GLFW standalone runtime
+- EnTT entity-component system
+- Assimp mesh import
+- GLM mathematics
+- Lua/sol2 legacy scripting compatibility
+- nlohmann/json scene and project serialization
+
+## Contributing
+
+Polyizon Engine 2 is being developed in visible milestones. Please keep changes
+compatible with both Editor and Client, preserve older `.scene` loading, and add
+tests for persisted formats or shared rendering infrastructure where practical.
 
 ## Credits
 
-See Help > Credits in the editor.
-
-## A note on the code
-
-Spaghetti tastes too good, that it is applied to code too.
-
-In other words: this codebase is not always clean, and that's fine. It's here to be forked, torn apart, and rebuilt into your own engine — messy code you can actually read and bend to your will beats a pristine architecture you're afraid to touch. Take it, make it yours.
+See **Help > Credits** inside the Editor.

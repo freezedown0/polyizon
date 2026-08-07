@@ -29,6 +29,7 @@ include(CompilerFlags)
 
 # Include dependency management
 include(DependencyManagement)
+include(CTest)
 
 # Add sub-projects
 add_subdirectory(core)
@@ -39,6 +40,10 @@ endif()
 
 if(POLYIZON_BUILD_GAME)
     add_subdirectory(game)
+endif()
+
+if(BUILD_TESTING)
+    add_subdirectory(tests)
 endif()
 
 # Installation rules (optional, for later)

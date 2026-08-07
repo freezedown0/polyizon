@@ -49,6 +49,10 @@ ScriptEngine::ScriptEngine() {
 void ScriptEngine::Update(entt::registry& registry, float deltaTime) {
     auto view = registry.view<TransformComponent, ScriptComponent>();
     for (auto entity : view) {
+        if (const auto* metadata = registry.try_get<const EntityMetadataComponent>(entity);
+            metadata != nullptr && !metadata->enabled) {
+            continue;
+        }
         const auto& [transform, scriptComponent] =
             view.get<TransformComponent, ScriptComponent>(entity);
         if (scriptComponent.scriptPath.empty()) {

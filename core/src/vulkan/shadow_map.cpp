@@ -8,13 +8,11 @@
 
 namespace polyizon {
 
-ShadowMap::ShadowMap(VulkanContext& context, VkFormat depthFormat, std::uint32_t resolution,
-    ShadowSamplerMode samplerMode)
+ShadowMap::ShadowMap(VulkanContext& context, VkFormat depthFormat, std::uint32_t resolution)
     : m_Device(context.GetDevice())
     , m_Allocator(context.GetAllocator())
     , m_Format(depthFormat)
-    , m_Resolution(resolution)
-    , m_SamplerMode(samplerMode) {
+    , m_Resolution(resolution) {
     CreateImage();
     CreateImageView();
     CreateSampler();
@@ -65,16 +63,12 @@ void ShadowMap::CreateImageView() {
 }
 
 void ShadowMap::CreateSampler() {
-    const bool hardwarePcf = (m_SamplerMode == ShadowSamplerMode::HardwarePcf);
-
     VkSamplerCreateInfo samplerInfo{};
     samplerInfo.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
-    // HardwarePcf: LINEAR blends the 4 nearest texels into a smooth
-    // visibility gradient. PlainNearest: NEAREST reads exactly one texel per
-    // fragment — with a low resolution (e.g. 4x4) this is what makes the
-    // shadow read as genuinely blocky rather than smoothly interpolated.
-    samplerInfo.magFilter = hardwarePcf ? VK_FILTER_LINEAR : VK_FILTER_NEAREST;
-    samplerInfo.minFilter = hardwarePcf ? VK_FILTER_LINEAR : VK_FILTER_NEAREST;
+    // LINEAR filtering enables hardware percentage-closer filtering for
+    // smooth shadow visibility at the sample boundary.
+    samplerInfo.magFilter = VK_FILTER_LINEAR;
+    samplerInfo.minFilter = VK_FILTER_LINEAR;
     // CLAMP_TO_BORDER + opaque-white border: world positions outside the
     // light's orthographic frustum (see LitUniformBufferObject::lightSpaceMatrix)
     // sample the border color instead of wrapping/clamping into unrelated
@@ -86,14 +80,12 @@ void ShadowMap::CreateSampler() {
     samplerInfo.borderColor = VK_BORDER_COLOR_FLOAT_OPAQUE_WHITE;
     samplerInfo.anisotropyEnable = VK_FALSE;
     samplerInfo.unnormalizedCoordinates = VK_FALSE;
-    // HardwarePcf: sampling this in-shader via a `sampler2DShadow` (see
+    // Sampling this in-shader via a `sampler2DShadow` (see
     // lit.frag) returns a single-tap [0,1] visibility factor directly,
     // comparing the interpolated reference depth (3rd texture coordinate)
     // against the stored depth with this compareOp — no manual PCF loop
-    // needed. PlainNearest: compareEnable=false — this is a plain sampler2D
-    // (see voxel_lit.frag), which reads the raw stored depth back so the
-    // shader can quantize+compare it manually for the blocky Z-stepping.
-    samplerInfo.compareEnable = hardwarePcf ? VK_TRUE : VK_FALSE;
+    // needed.
+    samplerInfo.compareEnable = VK_TRUE;
     samplerInfo.compareOp = VK_COMPARE_OP_LESS_OR_EQUAL;
     samplerInfo.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
     samplerInfo.minLod = 0.0f;

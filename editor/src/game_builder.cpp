@@ -149,7 +149,7 @@ void BuildGame(const Project& project, const std::filesystem::path& outputDir) {
     const std::filesystem::path outputScenesDir = outputDir / "Scenes";
     if (std::filesystem::exists(outputScenesDir)) {
         for (const auto& entry : std::filesystem::recursive_directory_iterator(outputScenesDir)) {
-            if (entry.is_regular_file() && entry.path().extension() == ".json") {
+            if (entry.is_regular_file() && entry.path().extension() == ".scene") {
                 RewriteAssetPathsInScene(entry.path(), project.GetRootDir());
             }
         }

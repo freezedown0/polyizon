@@ -12,7 +12,7 @@
 class Project {
 public:
     // Scaffolds <parentDir>/<name>/{Scenes,Scripts,Assets}/, writes
-    // project.json, and writes a default Scenes/Main.json (the same
+    // project.json, and writes a default Scenes/Main.scene (the same
     // plane+cube sample used throughout Phases 15-16, including the spin
     // script — see scene_serializer.hpp for the JSON schema this matches)
     // so a brand-new project has something to open immediately. The default
@@ -38,6 +38,6 @@ private:
 
     std::string m_Name;
     std::string m_EngineVersion;
-    std::string m_DefaultScene; // relative to m_RootDir, e.g. "Scenes/Main.json"
+    std::string m_DefaultScene; // relative to m_RootDir, e.g. "Scenes/Main.scene"
     std::filesystem::path m_RootDir;
 };

@@ -1,8 +1,10 @@
 #include "content_browser_panel.hpp"
 
 #include <QFileDialog>
+#include <QDir>
 #include <QFileInfo>
 #include <QFileSystemModel>
+#include <QHBoxLayout>
 #include <QMessageBox>
 #include <QPushButton>
 #include <QStringList>
@@ -13,19 +15,36 @@
 
 ContentBrowserPanel::ContentBrowserPanel(QWidget* parent) : QWidget(parent) {
     auto* layout = new QVBoxLayout(this);
-    layout->setContentsMargins(4, 4, 4, 4);
+    layout->setContentsMargins(8, 8, 8, 8);
+    layout->setSpacing(8);
 
-    auto* addFilesButton = new QPushButton("Add Files...", this);
+    auto* addFilesButton = new QPushButton("Import Assets...", this);
+    addFilesButton->setObjectName("PrimaryButton");
+    addFilesButton->setToolTip("Copy files into the selected project folder");
     connect(addFilesButton, &QPushButton::clicked, this, &ContentBrowserPanel::OnAddFiles);
-    layout->addWidget(addFilesButton);
+    auto* actionRow = new QHBoxLayout();
+    actionRow->addStretch();
+    actionRow->addWidget(addFilesButton);
+    layout->addLayout(actionRow);
 
     m_Model = new QFileSystemModel(this);
+    m_Model->setFilter(QDir::AllDirs | QDir::Files | QDir::NoDotAndDotDot);
+    m_Model->setNameFilters({
+        "*.scene", "*.lua", "*.obj", "*.fbx", "*.gltf", "*.glb",
+        "*.png", "*.jpg", "*.jpeg", "*.tga", "*.bmp", "*.hdr"
+    });
+    m_Model->setNameFilterDisables(false);
     // Root path is set later, once a project is opened (SetRootDirectory) —
     // an empty filter path here just means the model shows nothing until
     // then.
 
     m_TreeView = new QTreeView(this);
     m_TreeView->setModel(m_Model);
+    m_TreeView->setAlternatingRowColors(true);
+    m_TreeView->setAnimated(true);
+    m_TreeView->setIndentation(18);
+    m_TreeView->setSortingEnabled(true);
+    m_TreeView->setHeaderHidden(true);
     // Name column only — Size/Type/Date Modified add clutter with no use
     // yet (no per-asset metadata beyond the filename this phase).
     m_TreeView->hideColumn(1);
@@ -44,7 +63,7 @@ void ContentBrowserPanel::SetRootDirectory(const std::filesystem::path& rootDir)
 
 void ContentBrowserPanel::OnDoubleClicked(const QModelIndex& index) {
     const QFileInfo info = m_Model->fileInfo(index);
-    if (info.isDir() || info.suffix().compare("json", Qt::CaseInsensitive) != 0) {
+    if (info.isDir() || info.suffix().compare("scene", Qt::CaseInsensitive) != 0) {
         return;
     }
 

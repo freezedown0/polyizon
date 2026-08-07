@@ -41,6 +41,7 @@ private slots:
     void OnAddEmpty();
     void OnAddCube();
     void OnAddPlane();
+    void OnAddDirectionalLight();
     void OnAddPointLight();
     void OnAddSpotLight();
     void OnDeleteSelected();

@@ -38,4 +38,4 @@ set_target_properties(polyizon PROPERTIES
 
 # Application icon (window/taskbar/Explorer)
 include(AppIcon)
-polyizon_add_app_icon(polyizon "${CMAKE_SOURCE_DIR}/resources/Polyizon.ico")
+polyizon_add_app_icon(polyizon "${CMAKE_SOURCE_DIR}/temporaryassets/Mark1.ico")

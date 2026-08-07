@@ -3,6 +3,7 @@
 #include "polyizon/assets/mesh_import.hpp"
 
 #include "polyizon/scene/components.hpp"
+#include "polyizon/scene/entity_uuid.hpp"
 #include "polyizon/scene/lighting_settings.hpp"
 #include "polyizon/vulkan/context.hpp"
 
@@ -14,6 +15,7 @@
 #include <fstream>
 #include <stdexcept>
 #include <unordered_map>
+#include <unordered_set>
 
 namespace polyizon {
 
@@ -42,16 +44,20 @@ glm::vec3 JsonToVec3(const json& j) {
     return glm::vec3(j.at(0).get<float>(), j.at(1).get<float>(), j.at(2).get<float>());
 }
 
-const char* LightingModeToString(LightingMode mode) {
-    switch (mode) {
-        case LightingMode::Voxel: return "Voxel";
-        case LightingMode::Realistic:
-        default: return "Realistic";
+const char* LightMobilityToString(LightMobility mobility) {
+    switch (mobility) {
+    case LightMobility::Baked: return "baked";
+    case LightMobility::Mixed: return "mixed";
+    case LightMobility::Realtime: return "realtime";
     }
+    return "realtime";
 }
 
-LightingMode LightingModeFromString(const std::string& s) {
-    return s == "Voxel" ? LightingMode::Voxel : LightingMode::Realistic;
+LightMobility JsonToLightMobility(const json& value) {
+    const std::string mobility = value.is_string() ? value.get<std::string>() : "realtime";
+    if (mobility == "baked") return LightMobility::Baked;
+    if (mobility == "mixed") return LightMobility::Mixed;
+    return LightMobility::Realtime;
 }
 
 } // namespace
@@ -64,6 +70,16 @@ nlohmann::json SerializeSceneToJson(const Scene& scene) {
     auto view = registry.view<const TransformComponent>();
     for (const entt::entity entity : view) {
         json entityJson;
+
+        if (const auto* identity = registry.try_get<const IdentityComponent>(entity)) {
+            entityJson["id"] = identity->uuid;
+        }
+        if (const auto* metadata = registry.try_get<const EntityMetadataComponent>(entity)) {
+            entityJson["metadata"] = {
+                { "enabled", metadata->enabled },
+                { "staticForLighting", metadata->staticForLighting },
+            };
+        }
 
         if (const auto* tag = registry.try_get<const TagComponent>(entity)) {
             entityJson["tag"] = tag->name;
@@ -80,16 +96,34 @@ nlohmann::json SerializeSceneToJson(const Scene& scene) {
             entityJson["mesh"] = mesh->sourcePath;
         }
         if (const auto* material = registry.try_get<const MaterialComponent>(entity)) {
-            entityJson["material"] = { { "baseColor", Vec3ToJson(material->baseColor) } };
+            entityJson["material"] = {
+                { "baseColor", Vec3ToJson(material->baseColor) },
+                { "metallic", material->metallic },
+                { "roughness", material->roughness },
+                { "emissiveColor", Vec3ToJson(material->emissiveColor) },
+                { "emissiveIntensity", material->emissiveIntensity },
+            };
         }
         if (const auto* script = registry.try_get<const ScriptComponent>(entity)) {
             entityJson["script"] = script->scriptPath;
+        }
+        if (const auto* directionalLight = registry.try_get<const DirectionalLightComponent>(entity)) {
+            entityJson["directionalLight"] = {
+                { "color", Vec3ToJson(directionalLight->color) },
+                { "intensity", directionalLight->intensity },
+                { "enabled", directionalLight->enabled },
+                { "castsShadows", directionalLight->castsShadows },
+                { "mobility", LightMobilityToString(directionalLight->mobility) },
+            };
         }
         if (const auto* pointLight = registry.try_get<const PointLightComponent>(entity)) {
             entityJson["pointLight"] = {
                 { "color", Vec3ToJson(pointLight->color) },
                 { "intensity", pointLight->intensity },
                 { "range", pointLight->range },
+                { "enabled", pointLight->enabled },
+                { "castsShadows", pointLight->castsShadows },
+                { "mobility", LightMobilityToString(pointLight->mobility) },
             };
         }
         if (const auto* spotLight = registry.try_get<const SpotLightComponent>(entity)) {
@@ -99,6 +133,9 @@ nlohmann::json SerializeSceneToJson(const Scene& scene) {
                 { "range", spotLight->range },
                 { "innerConeDegrees", spotLight->innerConeDegrees },
                 { "outerConeDegrees", spotLight->outerConeDegrees },
+                { "enabled", spotLight->enabled },
+                { "castsShadows", spotLight->castsShadows },
+                { "mobility", LightMobilityToString(spotLight->mobility) },
             };
         }
 
@@ -107,12 +144,30 @@ nlohmann::json SerializeSceneToJson(const Scene& scene) {
 
     const SceneLightingSettings& lighting = scene.GetLightingSettings();
     json lightingJson;
-    lightingJson["mode"] = LightingModeToString(lighting.mode);
     lightingJson["sunElevationDegrees"] = lighting.sunElevationDegrees;
     lightingJson["sunAzimuthDegrees"] = lighting.sunAzimuthDegrees;
+    lightingJson["directionalLightColor"] = Vec3ToJson(lighting.directionalLightColor);
+    lightingJson["directionalLightIntensity"] = lighting.directionalLightIntensity;
     lightingJson["ambientStrength"] = lighting.ambientStrength;
+    lightingJson["skyExposure"] = lighting.skyExposure;
+    lightingJson["skySunIntensity"] = lighting.skySunIntensity;
+    lightingJson["clouds"] = {
+        { "enabled", lighting.cloudsEnabled },
+        { "layerBottomKm", lighting.cloudLayerBottomKm },
+        { "layerTopKm", lighting.cloudLayerTopKm },
+        { "coverage", lighting.cloudCoverage },
+        { "density", lighting.cloudDensity },
+        { "noiseScale", lighting.cloudNoiseScale },
+        { "windSpeed", lighting.cloudWindSpeed },
+        { "windDirectionDegrees", lighting.cloudWindDirectionDegrees },
+        { "powderStrength", lighting.cloudPowderStrength },
+        { "ambientStrength", lighting.cloudAmbientStrength },
+        { "primarySteps", lighting.cloudPrimarySteps },
+        { "shadowSteps", lighting.cloudShadowSteps },
+    };
 
     json root;
+    root["schemaVersion"] = 2;
     root["entities"] = std::move(entitiesJson);
     root["lighting"] = std::move(lightingJson);
     return root;
@@ -124,9 +179,29 @@ Scene DeserializeSceneFromJson(VulkanContext& context, const nlohmann::json& roo
     // of the same prop) shouldn't each re-run Assimp import - keyed by the
     // same sourcePath string MeshComponent/the JSON both use.
     std::unordered_map<std::string, std::shared_ptr<Mesh>> meshCache;
+    std::unordered_set<std::string> entityIds;
 
     for (const auto& entityJson : root.at("entities")) {
         const entt::entity entity = scene.CreateEntity();
+
+        auto& identity = scene.GetRegistry().get<IdentityComponent>(entity);
+        if (entityJson.contains("id")) {
+            const std::string serializedId = entityJson.at("id").get<std::string>();
+            if (IsValidEntityUuid(serializedId) && !entityIds.contains(serializedId)) {
+                identity.uuid = serializedId;
+            }
+        }
+        while (entityIds.contains(identity.uuid)) {
+            identity.uuid = GenerateEntityUuid();
+        }
+        entityIds.insert(identity.uuid);
+
+        auto& metadata = scene.GetRegistry().get<EntityMetadataComponent>(entity);
+        if (entityJson.contains("metadata")) {
+            const auto& metadataJson = entityJson.at("metadata");
+            metadata.enabled = metadataJson.value("enabled", true);
+            metadata.staticForLighting = metadataJson.value("staticForLighting", false);
+        }
 
         // Older (Phase 15/16) scene files predate TagComponent — default to
         // "Entity" rather than requiring every existing scene file to be
@@ -160,12 +235,32 @@ Scene DeserializeSceneFromJson(VulkanContext& context, const nlohmann::json& roo
 
         if (entityJson.contains("material")) {
             MaterialComponent material;
-            material.baseColor = JsonToVec3(entityJson.at("material").at("baseColor"));
+            const auto& materialJson = entityJson.at("material");
+            material.baseColor = JsonToVec3(materialJson.at("baseColor"));
+            material.metallic = materialJson.value("metallic", 0.0f);
+            material.roughness = materialJson.value("roughness", 0.6f);
+            if (materialJson.contains("emissiveColor")) {
+                material.emissiveColor = JsonToVec3(materialJson.at("emissiveColor"));
+            }
+            material.emissiveIntensity = materialJson.value("emissiveIntensity", 0.0f);
             scene.GetRegistry().emplace<MaterialComponent>(entity, material);
         }
 
         if (entityJson.contains("script")) {
             scene.GetRegistry().emplace<ScriptComponent>(entity, entityJson.at("script").get<std::string>());
+        }
+
+        if (entityJson.contains("directionalLight")) {
+            const auto& lightJson = entityJson.at("directionalLight");
+            DirectionalLightComponent light;
+            light.color = JsonToVec3(lightJson.at("color"));
+            light.intensity = lightJson.value("intensity", 1.0f);
+            light.enabled = lightJson.value("enabled", true);
+            light.castsShadows = lightJson.value("castsShadows", true);
+            if (lightJson.contains("mobility")) {
+                light.mobility = JsonToLightMobility(lightJson.at("mobility"));
+            }
+            scene.GetRegistry().emplace<DirectionalLightComponent>(entity, light);
         }
 
         if (entityJson.contains("pointLight")) {
@@ -174,6 +269,11 @@ Scene DeserializeSceneFromJson(VulkanContext& context, const nlohmann::json& roo
             pointLight.color = JsonToVec3(pointLightJson.at("color"));
             pointLight.intensity = pointLightJson.value("intensity", 1.0f);
             pointLight.range = pointLightJson.value("range", 10.0f);
+            pointLight.enabled = pointLightJson.value("enabled", true);
+            pointLight.castsShadows = pointLightJson.value("castsShadows", false);
+            if (pointLightJson.contains("mobility")) {
+                pointLight.mobility = JsonToLightMobility(pointLightJson.at("mobility"));
+            }
             scene.GetRegistry().emplace<PointLightComponent>(entity, pointLight);
         }
 
@@ -185,6 +285,11 @@ Scene DeserializeSceneFromJson(VulkanContext& context, const nlohmann::json& roo
             spotLight.range = spotLightJson.value("range", 10.0f);
             spotLight.innerConeDegrees = spotLightJson.value("innerConeDegrees", 20.0f);
             spotLight.outerConeDegrees = spotLightJson.value("outerConeDegrees", 30.0f);
+            spotLight.enabled = spotLightJson.value("enabled", true);
+            spotLight.castsShadows = spotLightJson.value("castsShadows", false);
+            if (spotLightJson.contains("mobility")) {
+                spotLight.mobility = JsonToLightMobility(spotLightJson.at("mobility"));
+            }
             scene.GetRegistry().emplace<SpotLightComponent>(entity, spotLight);
         }
     }
@@ -196,11 +301,51 @@ Scene DeserializeSceneFromJson(VulkanContext& context, const nlohmann::json& roo
     if (root.contains("lighting")) {
         const auto& lightingJson = root.at("lighting");
         SceneLightingSettings lighting;
-        lighting.mode = LightingModeFromString(lightingJson.value("mode", std::string("Realistic")));
+        // Voxel lighting was retired. Older files may still contain a mode
+        // field, but all scenes now load through the realistic environment.
         lighting.sunElevationDegrees = lightingJson.value("sunElevationDegrees", 25.0f);
         lighting.sunAzimuthDegrees = lightingJson.value("sunAzimuthDegrees", 0.0f);
+        if (lightingJson.contains("directionalLightColor")) {
+            lighting.directionalLightColor = JsonToVec3(lightingJson.at("directionalLightColor"));
+        }
+        lighting.directionalLightIntensity = lightingJson.value("directionalLightIntensity", 1.0f);
         lighting.ambientStrength = lightingJson.value("ambientStrength", 0.15f);
+        lighting.skyExposure = lightingJson.value("skyExposure", 1.15f);
+        lighting.skySunIntensity = lightingJson.value("skySunIntensity", 10.0f);
+        if (lightingJson.contains("clouds")) {
+            const auto& clouds = lightingJson.at("clouds");
+            lighting.cloudsEnabled = clouds.value("enabled", true);
+            lighting.cloudLayerBottomKm = clouds.value("layerBottomKm", 1.5f);
+            lighting.cloudLayerTopKm = clouds.value("layerTopKm", 4.0f);
+            lighting.cloudCoverage = clouds.value("coverage", 0.22f);
+            lighting.cloudDensity = clouds.value("density", 0.75f);
+            lighting.cloudNoiseScale = clouds.value("noiseScale", 0.14f);
+            lighting.cloudWindSpeed = clouds.value("windSpeed", 0.0015f);
+            lighting.cloudWindDirectionDegrees = clouds.value("windDirectionDegrees", 0.0f);
+            lighting.cloudPowderStrength = clouds.value("powderStrength", 0.8f);
+            lighting.cloudAmbientStrength = clouds.value("ambientStrength", 0.25f);
+            lighting.cloudPrimarySteps = clouds.value("primarySteps", 80);
+            lighting.cloudShadowSteps = clouds.value("shadowSteps", 10);
+        }
         scene.GetLightingSettings() = lighting;
+    }
+
+    // Version 1 scenes stored the primary sun only as environment numbers.
+    // Promote that data to a real Directional Light entity on load so the
+    // lighting and sky systems are independent without breaking old files.
+    const auto directionalLights = scene.GetRegistry().view<const DirectionalLightComponent>();
+    if (directionalLights.begin() == directionalLights.end()) {
+        const SceneLightingSettings& lighting = scene.GetLightingSettings();
+        const entt::entity lightEntity = scene.CreateEntity();
+        scene.GetRegistry().emplace<TagComponent>(lightEntity, "Directional Light");
+        TransformComponent transform;
+        transform.rotationEulerDegrees = glm::vec3(
+            -lighting.sunElevationDegrees, 90.0f - lighting.sunAzimuthDegrees, 0.0f);
+        scene.GetRegistry().emplace<TransformComponent>(lightEntity, transform);
+        DirectionalLightComponent light;
+        light.color = lighting.directionalLightColor;
+        light.intensity = lighting.directionalLightIntensity;
+        scene.GetRegistry().emplace<DirectionalLightComponent>(lightEntity, light);
     }
 
     return scene;

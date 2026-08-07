@@ -18,7 +18,7 @@ layout(set = 0, binding = 0) uniform SkyUBO {
     vec4 atmosphereParams1;
     vec4 cloudParams0; // x=layerBottom(km above planetR) y=layerTop z=coverage w=densityMultiplier
     vec4 cloudParams1; // x=windSpeed y=windDirection(rad) z=forwardG w=backG
-    vec4 cloudParams2; // x=powderStrength y=ambientStrength z=noiseUvScale w=reserved
+    vec4 cloudParams2; // x=powderStrength y=ambientStrength z=noiseUvScale w=enabled
     ivec4 stepCounts;  // x=atmosphere primary y=atmosphere sun z=cloud primary w=cloud shadow
 } sky;
 
@@ -126,6 +126,9 @@ vec3 ComputeAtmosphere(vec3 ro, vec3 rd, vec3 sunDir, float planetR, float atmR,
 // fades density to zero at both edges of the cloud shell.
 float SampleCloudDensity(vec3 p, float planetR, float bottom, float top, float coverage,
                           float densityMult, vec3 windOffset, float noiseScale) {
+    if (coverage <= 0.001 || densityMult <= 0.001) {
+        return 0.0;
+    }
     float heightFraction = clamp((length(p) - (planetR + bottom)) / max(top - bottom, 0.0001), 0.0, 1.0);
 
     // Traverse most of the 3D texture vertically across the cloud layer.
@@ -149,8 +152,9 @@ float SampleCloudDensity(vec3 p, float planetR, float bottom, float top, float c
         p.z * weatherScale + windOffset.z * 0.18);
     weatherUv.xz += noiseOrigin * 0.18;
     float weather = texture(cloudNoise, weatherUv).r;
-    float weatherThreshold = mix(0.62, 0.34, clamp(coverage, 0.0, 1.0));
+    float weatherThreshold = mix(0.72, 0.32, clamp(coverage, 0.0, 1.0));
     float cloudField = smoothstep(weatherThreshold - 0.06, weatherThreshold + 0.08, weather);
+    cloudField *= smoothstep(0.02, 0.14, coverage);
 
     // Weak weather cells form low clouds; strong cells grow tall, rounded
     // cauliflower tops. The sharp lower ramp preserves a condensation-level
@@ -365,12 +369,13 @@ void main() {
         0.0,
         sky.timeAndSun.x * windSpeed * sin(windDirection));
 
-    vec4 clouds = RaymarchClouds(cloudOrigin, rayDir, sunDir, planetR,
-        sky.cloudParams0.x, sky.cloudParams0.y, sky.cloudParams0.z, sky.cloudParams0.w,
-        windOffset, sky.cloudParams2.z, sky.cloudParams1.z, sky.cloudParams1.w,
-        sky.cloudParams2.x, sky.cloudParams2.y, sky.stepCounts.z, sky.stepCounts.w);
-
-    color = color * clouds.a + clouds.rgb;
+    if (sky.cloudParams2.w > 0.5) {
+        vec4 clouds = RaymarchClouds(cloudOrigin, rayDir, sunDir, planetR,
+            sky.cloudParams0.x, sky.cloudParams0.y, sky.cloudParams0.z, sky.cloudParams0.w,
+            windOffset, sky.cloudParams2.z, sky.cloudParams1.z, sky.cloudParams1.w,
+            sky.cloudParams2.x, sky.cloudParams2.y, sky.stepCounts.z, sky.stepCounts.w);
+        color = color * clouds.a + clouds.rgb;
+    }
 
     // Tonemap once, at the very end, over the fully composited HDR result
     // (atmosphere + sun disk + clouds) — applying it earlier/per-term would
