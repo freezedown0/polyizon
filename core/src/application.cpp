@@ -500,7 +500,7 @@ void Application::UpdateSkyUniformBuffer(std::uint32_t frameIndex, VkExtent2D ex
     // times the 128^3 noise volume tiles across the cloud layer.
     sky.cloudParams0 = glm::vec4(1.5f, 4.0f, m_CloudCoverage, m_CloudDensityMultiplier);
     sky.cloudParams1 = glm::vec4(m_CloudWindSpeed, glm::radians(m_CloudWindDirectionDegrees), 0.8f, -0.2f);
-    sky.cloudParams2 = glm::vec4(1.0f, 0.2f, 0.02f, 0.0f); // powderStrength, ambientStrength, noiseUvScale
+    sky.cloudParams2 = glm::vec4(1.0f, 0.2f, 0.16f, 0.0f); // powderStrength, ambientStrength, noiseUvScale
 
     sky.stepCounts = glm::ivec4(m_AtmospherePrimarySteps, m_AtmosphereSunSteps, m_CloudPrimarySteps, m_CloudSunShadowSteps);
 
@@ -795,7 +795,7 @@ void Application::BuildDebugOverlay() {
         ImGui::SliderInt("Atmosphere sun steps", &m_AtmosphereSunSteps, 2, 16);
         ImGui::SliderFloat("Cloud coverage", &m_CloudCoverage, 0.0f, 1.0f);
         ImGui::SliderFloat("Cloud density", &m_CloudDensityMultiplier, 0.0f, 3.0f);
-        ImGui::SliderFloat("Cloud wind speed", &m_CloudWindSpeed, 0.0f, 0.2f);
+        ImGui::SliderFloat("Cloud wind speed", &m_CloudWindSpeed, 0.0f, 0.05f, "%.3f");
         ImGui::SliderFloat("Cloud wind direction", &m_CloudWindDirectionDegrees, 0.0f, 360.0f);
         ImGui::SliderInt("Cloud steps", &m_CloudPrimarySteps, 16, 128);
         ImGui::SliderInt("Cloud shadow steps", &m_CloudSunShadowSteps, 2, 12);

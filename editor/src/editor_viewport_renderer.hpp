@@ -297,12 +297,12 @@ private:
     float m_SkyExposure = 1.2f;
     int m_AtmospherePrimarySteps = 16;
     int m_AtmosphereSunSteps = 8;
-    float m_CloudCoverage = 0.4f;
-    float m_CloudDensityMultiplier = 1.1f;
-    float m_CloudWindSpeed = 0.02f;
+    float m_CloudCoverage = 0.32f;
+    float m_CloudDensityMultiplier = 0.9f;
+    float m_CloudWindSpeed = 0.002f;
     float m_CloudWindDirectionDegrees = 0.0f;
-    int m_CloudPrimarySteps = 64;
-    int m_CloudSunShadowSteps = 8;
+    int m_CloudPrimarySteps = 96;
+    int m_CloudSunShadowSteps = 12;
 
     // Phase 20: Move/Rotate viewport gizmos. Geometry is rebuilt CPU-side
     // every frame (world-space line list, cheap — see RenderGizmo()) into a

@@ -570,7 +570,7 @@ void EditorViewportRenderer::UpdateSkyUniformBuffer(std::uint32_t frameIndex, Vk
 
     sky.cloudParams0 = glm::vec4(1.5f, 4.0f, m_CloudCoverage, m_CloudDensityMultiplier);
     sky.cloudParams1 = glm::vec4(m_CloudWindSpeed, glm::radians(m_CloudWindDirectionDegrees), 0.8f, -0.2f);
-    sky.cloudParams2 = glm::vec4(1.0f, 0.2f, 0.02f, 0.0f);
+    sky.cloudParams2 = glm::vec4(1.0f, 0.2f, 0.16f, 0.0f);
 
     sky.stepCounts = glm::ivec4(m_AtmospherePrimarySteps, m_AtmosphereSunSteps, m_CloudPrimarySteps, m_CloudSunShadowSteps);
 

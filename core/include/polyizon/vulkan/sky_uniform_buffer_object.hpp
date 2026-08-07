@@ -12,9 +12,9 @@ namespace polyizon {
 // std140 layout: every field is already vec4/mat4-sized/aligned (no bare
 // float/int members), so no explicit padding/alignas is needed.
 struct SkyUniformBufferObject {
-    glm::mat4 invView; // only mat3(invView) (rotation) is used in-shader — the
-                        // sky is an infinite background decoupled from the
-                        // camera's world-space translation (see sky.frag).
+    glm::mat4 invView; // rotation reconstructs the sky ray; translation is
+                        // converted from engine metres to virtual kilometres
+                        // for volumetric-cloud parallax (see sky.frag).
     glm::mat4 invProj; // inverse of the same Y-flipped projection used for the quads.
 
     glm::vec4 sunDirection;      // xyz normalized, world space, pointing TOWARD the sun. w unused.
