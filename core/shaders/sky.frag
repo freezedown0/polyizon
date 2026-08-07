@@ -124,27 +124,51 @@ vec3 ComputeAtmosphere(vec3 ro, vec3 rd, vec3 sunDir, float planetR, float atmR,
 // erosion detail, blended in with decreasing weight per Schneider's talk.
 // heightFraction (0 at layer bottom, 1 at layer top) drives a gradient that
 // fades density to zero at both edges of the cloud shell.
-float RemapCloud(float density, float coverage, float heightFraction) {
-    float gradient = smoothstep(0.0, 0.2, heightFraction) * smoothstep(1.0, 0.7, heightFraction);
-    density *= gradient;
-    return clamp((density - (1.0 - coverage)) / max(coverage, 0.0001), 0.0, 1.0);
-}
-
 float SampleCloudDensity(vec3 p, float planetR, float bottom, float top, float coverage,
                           float densityMult, vec3 windOffset, float noiseScale) {
-    vec4 n = texture(cloudNoise, p * noiseScale + windOffset);
-    float baseShape = n.r;
-    float erosion = n.g * 0.625 + n.b * 0.25 + n.a * 0.125;
-    // Erode more aggressively than a flat subtraction: edges/thin regions
-    // (low baseShape) get carved away almost entirely by low erosion values,
-    // while dense cores survive — this is what turns a smooth haze into
-    // distinct, separated puffs instead of one continuous translucent layer.
-    float shaped = clamp(baseShape - (1.0 - erosion) * 0.55, 0.0, 1.0);
-    // Extra contrast: push mid/low densities down further, keep strong cores
-    // relatively intact, sharpening the visible silhouette.
-    shaped = pow(shaped, 1.6);
     float heightFraction = clamp((length(p) - (planetR + bottom)) / max(top - bottom, 0.0001), 0.0, 1.0);
-    return RemapCloud(shaped, coverage, heightFraction) * densityMult;
+
+    // Traverse most of the 3D texture vertically across the cloud layer.
+    // The previous p*noiseScale mapping covered only about 0.05 texture
+    // units from base to top, so it behaved like one extruded 2D slice.
+    const vec2 noiseOrigin = vec2(0.10, 0.40);
+    vec3 shapeUv = vec3(
+        p.x * noiseScale + windOffset.x,
+        heightFraction * 0.82 + 0.11,
+        p.z * noiseScale + windOffset.z);
+    shapeUv.xz += noiseOrigin;
+    vec4 n = texture(cloudNoise, shapeUv);
+
+    // A low-frequency base-noise sample is the weather map. It creates
+    // broad clear regions and clustered cloud systems before local 3D shape
+    // and erosion are applied.
+    float weatherScale = noiseScale * 0.18;
+    vec3 weatherUv = vec3(
+        p.x * weatherScale + windOffset.x * 0.18,
+        0.37,
+        p.z * weatherScale + windOffset.z * 0.18);
+    weatherUv.xz += noiseOrigin * 0.18;
+    float weather = texture(cloudNoise, weatherUv).r;
+    float weatherThreshold = mix(0.62, 0.34, clamp(coverage, 0.0, 1.0));
+    float cloudField = smoothstep(weatherThreshold - 0.06, weatherThreshold + 0.08, weather);
+
+    // Weak weather cells form low clouds; strong cells grow tall, rounded
+    // cauliflower tops. The sharp lower ramp preserves a condensation-level
+    // base while the upper ramp stays soft and irregular.
+    float cloudType = smoothstep(weatherThreshold - 0.02, min(weatherThreshold + 0.10, 0.98), weather);
+    float topHeight = mix(0.48, 1.0, cloudType);
+    float baseProfile = smoothstep(0.0, 0.07, heightFraction);
+    float topProfile = 1.0 - smoothstep(max(topHeight - 0.2, 0.08), topHeight, heightFraction);
+    float heightProfile = baseProfile * topProfile;
+
+    // R is the Perlin-Worley body; G/B/A are progressively finer Worley
+    // octaves. Erode the boundary while leaving dense interiors intact.
+    float erosion = n.g * 0.625 + n.b * 0.25 + n.a * 0.125;
+    float localThreshold = mix(0.56, 0.34, clamp(coverage, 0.0, 1.0));
+    float baseDensity = smoothstep(localThreshold, localThreshold + 0.12, n.r);
+    float edgeErosion = (1.0 - erosion) * 0.32 * (1.0 - baseDensity * 0.65);
+    float shapedDensity = clamp(baseDensity - edgeErosion, 0.0, 1.0);
+    return shapedDensity * cloudField * heightProfile * densityMult;
 }
 
 // ACES filmic tonemap (Narkowicz 2015 fit): compresses unbounded HDR
@@ -168,17 +192,37 @@ float HenyeyGreenstein(float mu, float g) {
     return (1.0 - g2) / (4.0 * kPi * pow(max(1.0 + g2 - 2.0 * g * mu, 1e-4), 1.5));
 }
 
-// Short raymarch from a cloud sample point toward the sun, accumulating
-// density to approximate self-shadowing (Beer's-law-style transmittance).
-float SunShadowRaymarch(vec3 p, vec3 sunDir, float planetR, float bottom, float top, float coverage,
-                         float densityMult, vec3 windOffset, float noiseScale, int steps) {
-    float stepSize = max(top - bottom, 0.0001) / float(max(steps, 1)) * 0.5;
-    float accum = 0.0;
-    for (int i = 0; i < steps; ++i) {
-        p += sunDir * stepSize;
-        accum += SampleCloudDensity(p, planetR, bottom, top, coverage, densityMult, windOffset, noiseScale) * stepSize;
+// Raymarch all the way from a cloud sample to the sun-facing edge of the
+// outer cloud shell. Using a fixed fraction of the layer thickness here is
+// incorrect for oblique sunlight: at low sun elevations that short ray ends
+// while it is still inside the cloud and misses most of the optical depth.
+float SunOpticalDepth(vec3 p, vec3 sunDir, float planetR, float bottom, float top, float coverage,
+                       float densityMult, vec3 windOffset, float noiseScale, int steps) {
+    vec2 shellHit = RaySphereIntersect(p, sunDir, planetR + top);
+    if (shellHit.y <= 0.0 || steps <= 0) {
+        return 0.0;
     }
-    return exp(-accum);
+
+    // Local self-shadowing is visually dominant. At grazing angles the
+    // spherical exit can be hundreds of kilometres away; integrating every
+    // distant cloud bank would make the whole sky uniformly gray and is too
+    // undersampled for this small secondary-ray budget.
+    float rayLength = min(shellHit.y, 18.0);
+    float opticalDepth = 0.0;
+    float previousDistance = 0.0;
+    for (int i = 0; i < steps; ++i) {
+        // Quadratic placement spends more of the small shadow budget near
+        // the shaded point while still reaching the shell edge at grazing
+        // sun angles.
+        float u = (float(i) + 1.0) / float(steps);
+        float distance = rayLength * u * u;
+        float segmentLength = distance - previousDistance;
+        vec3 samplePoint = p + sunDir * (previousDistance + segmentLength * 0.5);
+        opticalDepth += SampleCloudDensity(samplePoint, planetR, bottom, top, coverage,
+            densityMult, windOffset, noiseScale) * segmentLength;
+        previousDistance = distance;
+    }
+    return opticalDepth;
 }
 
 // Front-to-back raymarch through the cloud-layer shell. Returns
@@ -209,25 +253,56 @@ vec4 RaymarchClouds(vec3 ro, vec3 rd, vec3 sunDir, float planetR, float bottom, 
         return vec4(0.0, 0.0, 0.0, 1.0);
     }
 
+    // Very shallow rays can remain in the spherical layer for hundreds of
+    // kilometres. A finite cloud horizon avoids undersampled stripe bands
+    // and lets distant formations dissolve naturally into atmospheric haze.
+    const float cloudFadeStart = 55.0;
+    const float cloudRenderDistance = 80.0;
+    tEnd = min(tEnd, cloudRenderDistance);
+    if (tEnd <= tStart) {
+        return vec4(0.0, 0.0, 0.0, 1.0);
+    }
+
     float stepSize = (tEnd - tStart) / float(primarySteps);
     float mu = dot(rd, sunDir);
-    float phase = mix(HenyeyGreenstein(mu, forwardG), HenyeyGreenstein(mu, backG), 0.5);
+    // The forward lobe carries most of the energy and produces the bright
+    // rim around the sun. The weaker back lobe keeps the opposite side from
+    // looking completely flat. Multiplying by 4pi converts the normalized
+    // phase function into a convenient unit-average lighting response.
+    float phase = mix(HenyeyGreenstein(mu, backG), HenyeyGreenstein(mu, forwardG), 0.8) * (4.0 * kPi);
+
+    float daylight = smoothstep(-0.08, 0.04, sunDir.y);
+    float sunWarmth = smoothstep(-0.02, 0.35, sunDir.y);
+    vec3 sunColor = mix(vec3(1.0, 0.28, 0.08), vec3(1.0, 0.95, 0.82), sunWarmth);
+    vec3 zenithAmbient = mix(vec3(0.015, 0.02, 0.04), vec3(0.24, 0.38, 0.62), daylight);
 
     vec3 scattered = vec3(0.0);
     float transmittance = 1.0;
-    float t = tStart;
+    // Stable screen-space jitter hides equally spaced raymarch bands without
+    // introducing time-dependent shimmer.
+    float jitter = fract(52.9829189 * fract(dot(gl_FragCoord.xy, vec2(0.06711056, 0.00583715))));
+    float t = tStart + stepSize * (0.5 + (jitter - 0.5) * 0.3);
     for (int i = 0; i < primarySteps && transmittance > 0.01; ++i) {
-        vec3 p = ro + rd * (t + stepSize * 0.5);
+        vec3 p = ro + rd * t;
         float density = SampleCloudDensity(p, planetR, bottom, top, coverage, densityMult, windOffset, noiseScale);
+        density *= 1.0 - smoothstep(cloudFadeStart, cloudRenderDistance, t);
         if (density > 0.001) {
-            float sunT = SunShadowRaymarch(p, sunDir, planetR, bottom, top, coverage, densityMult, windOffset, noiseScale, shadowSteps);
-            float powderTerm = 1.0 - exp(-density * 2.0 * powder);
-            vec3 sunColor = vec3(1.0, 0.95, 0.85) * max(sunDir.y, 0.05) * 2.0;
-            // Ambient is intentionally weak relative to direct sun*shadow
-            // lighting: sunT alone should carve visible dark undersides vs
-            // bright, sun-facing tops. A strong flat ambient term is what
-            // flattened the earlier result into a uniform haze.
-            vec3 luminance = sunColor * phase * sunT * powderTerm + vec3(0.35, 0.4, 0.55) * ambient * (0.3 + 0.7 * sunT);
+            float sunDepth = SunOpticalDepth(p, sunDir, planetR, bottom, top, coverage,
+                densityMult, windOffset, noiseScale, shadowSteps);
+            float directT = exp(-sunDepth * 1.5);
+
+            // A cheap second scattering order: light penetrating dense cloud
+            // is softer and less directional, preventing pitch-black cores
+            // without washing out the primary self-shadowing.
+            float bouncedT = exp(-sunDepth * 0.35);
+            float powderTerm = 1.0 + powder * (1.0 - exp(-density * 2.0));
+            float heightFraction = clamp((length(p) - (planetR + bottom)) / max(top - bottom, 0.0001), 0.0, 1.0);
+            float ambientHeight = mix(0.35, 1.0, smoothstep(0.0, 0.7, heightFraction));
+
+            vec3 directLight = sunColor * daylight * phase * directT * powderTerm;
+            vec3 bouncedLight = sunColor * daylight * bouncedT * 0.16;
+            vec3 ambientLight = zenithAmbient * ambient * ambientHeight;
+            vec3 luminance = directLight + bouncedLight + ambientLight;
             float stepTransmittance = exp(-density * stepSize * 4.0);
             scattered += transmittance * luminance * (1.0 - stepTransmittance);
             transmittance *= stepTransmittance;
@@ -240,9 +315,8 @@ vec4 RaymarchClouds(vec3 ro, vec3 rd, vec3 sunDir, float planetR, float bottom, 
 void main() {
     vec4 viewPos = sky.invProj * vec4(vNdc, 1.0, 1.0);
     viewPos /= viewPos.w;
-    // Only the rotation part of invView is used: the sky is an infinite
-    // background decoupled from the camera's world-space translation (see
-    // sky_uniform_buffer_object.hpp).
+    // Rotation reconstructs the view ray. Translation is used separately
+    // below for cloud parallax while the atmosphere remains infinite.
     vec3 rayDir = normalize(mat3(sky.invView) * viewPos.xyz);
     vec3 sunDir = normalize(sky.sunDirection.xyz);
 
@@ -255,14 +329,18 @@ void main() {
     float sunIntensity = sky.atmosphereParams1.z;
     float exposure = sky.atmosphereParams1.w;
 
-    // Fixed virtual eye point, not the literal (tiny-scale) camera position —
-    // see sky_uniform_buffer_object.hpp's invView comment.
-    vec3 rayOrigin = vec3(0.0, planetR + eyeHeight, 0.0);
+    // Fixed virtual eye point for atmospheric scattering.
+    vec3 atmosphereOrigin = vec3(0.0, planetR + eyeHeight, 0.0);
+    // Engine world units are metres; feed camera translation into the cloud
+    // volume in kilometres for real parallax while keeping the atmosphere
+    // itself an effectively infinite background.
+    vec3 cameraPositionKm = sky.invView[3].xyz * 0.001;
+    vec3 cloudOrigin = atmosphereOrigin + cameraPositionKm;
 
     const vec3 betaR = vec3(0.0058, 0.0135, 0.0331); // per km, standard Rayleigh scattering coefficients
     const float betaM = 0.021;                        // per km, Mie extinction coefficient
 
-    vec3 color = ComputeAtmosphere(rayOrigin, rayDir, sunDir, planetR, planetR + atmH,
+    vec3 color = ComputeAtmosphere(atmosphereOrigin, rayDir, sunDir, planetR, planetR + atmH,
         rayleighH, mieH, betaR, betaM, mieG, sunIntensity, sky.stepCounts.x, sky.stepCounts.y);
 
     // Sun disk: a soft-edged core (smoothstep across a couple degrees, not a
@@ -287,7 +365,7 @@ void main() {
         0.0,
         sky.timeAndSun.x * windSpeed * sin(windDirection));
 
-    vec4 clouds = RaymarchClouds(rayOrigin, rayDir, sunDir, planetR,
+    vec4 clouds = RaymarchClouds(cloudOrigin, rayDir, sunDir, planetR,
         sky.cloudParams0.x, sky.cloudParams0.y, sky.cloudParams0.z, sky.cloudParams0.w,
         windOffset, sky.cloudParams2.z, sky.cloudParams1.z, sky.cloudParams1.w,
         sky.cloudParams2.x, sky.cloudParams2.y, sky.stepCounts.z, sky.stepCounts.w);

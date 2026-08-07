@@ -194,12 +194,12 @@ private:
     // noise UV scale are fixed constants (not exposed) — only the ones worth
     // live-tweaking for the coverage/density/wind/performance tradeoff are
     // sliders.
-    float m_CloudCoverage = 0.4f;
-    float m_CloudDensityMultiplier = 1.1f;
-    float m_CloudWindSpeed = 0.02f;
+    float m_CloudCoverage = 0.32f;
+    float m_CloudDensityMultiplier = 0.9f;
+    float m_CloudWindSpeed = 0.002f;
     float m_CloudWindDirectionDegrees = 0.0f;
-    int m_CloudPrimarySteps = 64;
-    int m_CloudSunShadowSteps = 8;
+    int m_CloudPrimarySteps = 96;
+    int m_CloudSunShadowSteps = 12;
 
     // Distance fog for the quad scene (see UpdateUniformBuffer()/triangle.frag).
     float m_FogDensity = 0.06f;

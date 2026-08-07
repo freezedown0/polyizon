@@ -322,10 +322,10 @@ void GameSceneRenderer::UpdateSkyUniformBuffer(
     sky.timeAndSun = glm::vec4(time, glm::radians(1.5f), 0.0f, 0.0f);
     sky.atmosphereParams0 = glm::vec4(6360.0f, 60.0f, 0.5f, 8.0f);
     sky.atmosphereParams1 = glm::vec4(1.2f, 0.76f, 10.0f, 1.2f);
-    sky.cloudParams0 = glm::vec4(1.5f, 4.0f, 0.4f, 1.1f);
-    sky.cloudParams1 = glm::vec4(0.02f, 0.0f, 0.8f, -0.2f);
-    sky.cloudParams2 = glm::vec4(1.0f, 0.2f, 0.02f, 0.0f);
-    sky.stepCounts = glm::ivec4(16, 8, 64, 8);
+    sky.cloudParams0 = glm::vec4(1.5f, 4.0f, 0.32f, 0.9f);
+    sky.cloudParams1 = glm::vec4(0.002f, 0.0f, 0.8f, -0.2f);
+    sky.cloudParams2 = glm::vec4(1.0f, 0.2f, 0.16f, 0.0f);
+    sky.stepCounts = glm::ivec4(16, 8, 96, 12);
 
     m_SkyUniformBuffers[frameIndex]->Upload(&sky, sizeof(sky));
 }
