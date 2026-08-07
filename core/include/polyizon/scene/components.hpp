@@ -10,6 +10,20 @@
 
 namespace polyizon {
 
+// Stable identity persists across saves, builds, prefab links, and future
+// asset/bake references. EnTT's numeric entity value is runtime-only.
+struct IdentityComponent {
+    std::string uuid;
+};
+
+// Authoring state common to every entity. staticForLighting is consumed by
+// the upcoming light-bake scene builder; it is deliberately independent from
+// whether the entity is currently active.
+struct EntityMetadataComponent {
+    bool enabled = true;
+    bool staticForLighting = false;
+};
+
 // Human-readable entity identity, shown by the editor's Hierarchy panel (see
 // editor/src/hierarchy_panel.hpp) — entities have no other name/label
 // anywhere else in the engine. Every entity gets one; there's no notion of
@@ -67,6 +81,10 @@ struct MeshComponent {
 // phase has no per-vertex color or textured materials (see mesh_vertex.hpp).
 struct MaterialComponent {
     glm::vec3 baseColor{1.0f};
+    float metallic = 0.0f;
+    float roughness = 0.6f;
+    glm::vec3 emissiveColor{0.0f};
+    float emissiveIntensity = 0.0f;
 };
 
 // Optional: a Lua script file (see editor/src/script_engine.hpp) driving this
@@ -79,11 +97,30 @@ struct ScriptComponent {
     std::string scriptPath;
 };
 
+// Shared by all authored lights. Realtime and Mixed lights contribute to
+// dynamic rendering; Baked and Mixed lights are inputs to the light baker.
+enum class LightMobility {
+    Realtime,
+    Mixed,
+    Baked,
+};
+
+// Direct sunlight is an entity component, independent from the sky
+// environment. Its Transform points the light along local -Z. Scenes without
+// one retain the scene environment's sun as a compatibility fallback.
+struct DirectionalLightComponent {
+    glm::vec3 color{1.0f, 0.95f, 0.85f};
+    float intensity = 1.0f;
+    bool enabled = true;
+    bool castsShadows = true;
+    LightMobility mobility = LightMobility::Realtime;
+};
+
 // Omnidirectional light at this entity's TransformComponent::position — no
 // shadow casting (only the scene's sun does, see ShadowMap/ShadowPipeline),
 // just a forward-additive Lambertian contribution with linear-squared
 // distance falloff to `range` (see EditorViewportRenderer::
-// UpdateLitUniformBuffer and lit.frag/voxel_lit.frag's
+// UpdateLitUniformBuffer and lit.frag's
 // ComputePointLightContribution). Capped at kMaxPointLights simultaneously
 // active lights per scene (see lit_uniform_buffer_object.hpp) — a scene with
 // more than that just has the extras silently ignored, same "no soft cap
@@ -93,6 +130,9 @@ struct PointLightComponent {
     glm::vec3 color{1.0f};
     float intensity = 1.0f;
     float range = 10.0f;
+    bool enabled = true;
+    bool castsShadows = false;
+    LightMobility mobility = LightMobility::Realtime;
 };
 
 // Same falloff model as PointLightComponent, additionally narrowed to a cone
@@ -108,6 +148,9 @@ struct SpotLightComponent {
     float range = 10.0f;
     float innerConeDegrees = 20.0f;
     float outerConeDegrees = 30.0f;
+    bool enabled = true;
+    bool castsShadows = false;
+    LightMobility mobility = LightMobility::Realtime;
 };
 
 } // namespace polyizon

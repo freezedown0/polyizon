@@ -3,6 +3,7 @@
 #include "vulkan_viewport_window.hpp"
 
 #include "editor_viewport_renderer.hpp"
+#include "component_icons.hpp"
 
 #include "polyizon/assets/mesh_import.hpp"
 #include "polyizon/scene/components.hpp"
@@ -12,10 +13,17 @@
 #include <Windows.h>
 
 #include <QHBoxLayout>
+#include <QBrush>
+#include <QColor>
+#include <QFont>
 #include <QListWidget>
 #include <QListWidgetItem>
+#include <QMenu>
 #include <QMessageBox>
 #include <QPushButton>
+#include <QSignalBlocker>
+#include <QStringList>
+#include <QToolButton>
 #include <QVBoxLayout>
 
 #include <stdexcept>
@@ -42,36 +50,61 @@ constexpr int kEntityRole = Qt::UserRole;
 HierarchyPanel::HierarchyPanel(VulkanViewportWindow* viewportWindow, QWidget* parent)
     : QWidget(parent), m_ViewportWindow(viewportWindow) {
     auto* layout = new QVBoxLayout(this);
-    layout->setContentsMargins(4, 4, 4, 4);
+    layout->setContentsMargins(8, 8, 8, 8);
+    layout->setSpacing(8);
 
     auto* toolbar = new QHBoxLayout();
-    auto* addEmptyButton = new QPushButton("Add Empty", this);
-    auto* addCubeButton = new QPushButton("Add Cube", this);
-    auto* addPlaneButton = new QPushButton("Add Plane", this);
-    auto* addPointLightButton = new QPushButton("Add Point Light", this);
-    auto* addSpotLightButton = new QPushButton("Add Spot Light", this);
-    auto* deleteButton = new QPushButton("Delete Selected", this);
-    toolbar->addWidget(addEmptyButton);
-    toolbar->addWidget(addCubeButton);
-    toolbar->addWidget(addPlaneButton);
-    toolbar->addWidget(addPointLightButton);
-    toolbar->addWidget(addSpotLightButton);
+    auto* addButton = new QToolButton(this);
+    addButton->setText("+  Create");
+    addButton->setObjectName("CreateEntityButton");
+    addButton->setPopupMode(QToolButton::InstantPopup);
+    auto* createMenu = new QMenu(addButton);
+    QAction* addEmptyAction = createMenu->addAction("Empty Entity");
+    addEmptyAction->setIcon(GetComponentIcon(ComponentIconKind::Entity));
+    createMenu->addSeparator();
+    QAction* addCubeAction = createMenu->addAction("Cube");
+    QAction* addPlaneAction = createMenu->addAction("Plane");
+    addCubeAction->setIcon(GetComponentIcon(ComponentIconKind::Mesh));
+    addPlaneAction->setIcon(GetComponentIcon(ComponentIconKind::Mesh));
+    createMenu->addSeparator();
+    QAction* addDirectionalLightAction = createMenu->addAction("Directional Light");
+    QAction* addPointLightAction = createMenu->addAction("Point Light");
+    QAction* addSpotLightAction = createMenu->addAction("Spot Light");
+    addDirectionalLightAction->setIcon(GetComponentIcon(ComponentIconKind::DirectionalLight));
+    addPointLightAction->setIcon(GetComponentIcon(ComponentIconKind::PointLight));
+    addSpotLightAction->setIcon(GetComponentIcon(ComponentIconKind::SpotLight));
+    addButton->setMenu(createMenu);
+
+    auto* deleteButton = new QPushButton("Delete", this);
+    deleteButton->setObjectName("DangerButton");
+    deleteButton->setToolTip("Delete the selected entity");
+    toolbar->addWidget(addButton);
+    toolbar->addStretch();
     toolbar->addWidget(deleteButton);
     layout->addLayout(toolbar);
 
     m_ListWidget = new QListWidget(this);
+    m_ListWidget->setAlternatingRowColors(true);
+    m_ListWidget->setSpacing(1);
     layout->addWidget(m_ListWidget);
 
-    connect(addEmptyButton, &QPushButton::clicked, this, &HierarchyPanel::OnAddEmpty);
-    connect(addCubeButton, &QPushButton::clicked, this, &HierarchyPanel::OnAddCube);
-    connect(addPlaneButton, &QPushButton::clicked, this, &HierarchyPanel::OnAddPlane);
-    connect(addPointLightButton, &QPushButton::clicked, this, &HierarchyPanel::OnAddPointLight);
-    connect(addSpotLightButton, &QPushButton::clicked, this, &HierarchyPanel::OnAddSpotLight);
+    connect(addEmptyAction, &QAction::triggered, this, &HierarchyPanel::OnAddEmpty);
+    connect(addCubeAction, &QAction::triggered, this, &HierarchyPanel::OnAddCube);
+    connect(addPlaneAction, &QAction::triggered, this, &HierarchyPanel::OnAddPlane);
+    connect(addDirectionalLightAction, &QAction::triggered, this, &HierarchyPanel::OnAddDirectionalLight);
+    connect(addPointLightAction, &QAction::triggered, this, &HierarchyPanel::OnAddPointLight);
+    connect(addSpotLightAction, &QAction::triggered, this, &HierarchyPanel::OnAddSpotLight);
     connect(deleteButton, &QPushButton::clicked, this, &HierarchyPanel::OnDeleteSelected);
     connect(m_ListWidget, &QListWidget::itemSelectionChanged, this, &HierarchyPanel::OnSelectionChanged);
 }
 
 void HierarchyPanel::Refresh() {
+    entt::entity previouslySelected = entt::null;
+    if (QListWidgetItem* current = m_ListWidget->currentItem()) {
+        previouslySelected = static_cast<entt::entity>(current->data(kEntityRole).toUInt());
+    }
+
+    const QSignalBlocker selectionBlocker(m_ListWidget);
     m_ListWidget->clear();
 
     polyizon::EditorViewportRenderer* renderer = m_ViewportWindow->GetRenderer();
@@ -84,8 +117,24 @@ void HierarchyPanel::Refresh() {
     for (const entt::entity entity : view) {
         const auto& tag = view.get<polyizon::TagComponent>(entity);
         auto* item = new QListWidgetItem(QString::fromStdString(tag.name));
+        item->setIcon(GetEntityIcon(registry, entity));
+        if (const auto* metadata = registry.try_get<polyizon::EntityMetadataComponent>(entity)) {
+            QStringList state;
+            if (!metadata->enabled) {
+                item->setForeground(QBrush(QColor("#737c89")));
+                QFont font = item->font();
+                font.setItalic(true);
+                item->setFont(font);
+                state.push_back("Inactive");
+            }
+            if (metadata->staticForLighting) state.push_back("Contributes to baked lighting");
+            if (!state.isEmpty()) item->setToolTip(state.join(" · "));
+        }
         item->setData(kEntityRole, QVariant(static_cast<quint32>(entity)));
         m_ListWidget->addItem(item);
+        if (entity == previouslySelected) {
+            m_ListWidget->setCurrentItem(item);
+        }
     }
 }
 
@@ -109,6 +158,23 @@ void HierarchyPanel::OnAddCube() {
 
 void HierarchyPanel::OnAddPlane() {
     AddMeshEntity("Plane", "models/plane.obj");
+}
+
+void HierarchyPanel::OnAddDirectionalLight() {
+    polyizon::EditorViewportRenderer* renderer = m_ViewportWindow->GetRenderer();
+    if (!renderer) {
+        return;
+    }
+    m_ViewportWindow->MaybeWarnEditDuringPlay(this);
+
+    polyizon::Scene& scene = renderer->GetScene();
+    const entt::entity entity = scene.CreateEntity();
+    scene.GetRegistry().emplace<polyizon::TagComponent>(entity, "Directional Light");
+    polyizon::TransformComponent transform;
+    transform.rotationEulerDegrees = glm::vec3(-25.0f, 90.0f, 0.0f);
+    scene.GetRegistry().emplace<polyizon::TransformComponent>(entity, transform);
+    scene.GetRegistry().emplace<polyizon::DirectionalLightComponent>(entity);
+    Refresh();
 }
 
 void HierarchyPanel::OnAddPointLight() {

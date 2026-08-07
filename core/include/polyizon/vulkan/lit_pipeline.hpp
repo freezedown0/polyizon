@@ -16,6 +16,8 @@ namespace polyizon {
 struct LitPushConstants {
     alignas(16) float model[16]; // glm::mat4, column-major — avoids a glm include in this header
     alignas(16) float baseColor[4];
+    alignas(16) float materialParams[4]; // x metallic, y roughness
+    alignas(16) float emissiveColorAndIntensity[4];
 };
 
 // Main lit-scene pipeline (lit.vert/lit.frag): Lambertian (N.L) diffuse

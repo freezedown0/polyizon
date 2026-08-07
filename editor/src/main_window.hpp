@@ -30,12 +30,8 @@ class VulkanViewportWindow;
 // action (the panels' edits are otherwise never written back to disk) and
 // generalizes scene-loading so Content Browser can switch to a different
 // scene file within the same project, not just the project's default one.
-// Phase 18 adds a Lighting menu (Realistic/Voxel) that toggles the loaded
-// scene's SceneLightingSettings::mode directly — a live in-memory switch,
-// persisted only through the existing Save Scene action. Phase 19 adds a
-// Play menu/toolbar (Play/Pause/Stop, see EditorViewportRenderer::PlayState)
-// and a Lighting > Settings... dialog for the sun/ambient sliders that
-// SceneLightingSettings has always had but no UI could edit until now.
+// The Lighting menu opens the scene Environment Editor. Play/Pause/Stop
+// controls use EditorViewportRenderer::PlayState.
 class MainWindow : public QMainWindow {
     Q_OBJECT
 
@@ -53,7 +49,6 @@ private slots:
     // from LoadSceneFile — a scene requested before the viewport's first
     // paint is applied later, deferred (see SceneLoaded's doc comment), and
     // this must run after either case, not just the synchronous one.
-    void SyncLightingModeMenu();
 
     // Play/Pause/Stop — see EditorViewportRenderer::Play()/Pause()/Stop() for
     // the actual state machine; these just forward to it and keep the
@@ -77,7 +72,6 @@ private:
     // Shared by the Lighting menu's two actions: writes straight into the
     // loaded scene's live SceneLightingSettings — a no-op if no
     // project/scene is loaded yet (renderer is null).
-    void SetLightingMode(polyizon::LightingMode mode);
 
     // Enabled state depends on both whether a scene is loaded at all (same
     // gate as m_SaveSceneAction) and the renderer's current PlayState — e.g.
@@ -100,8 +94,6 @@ private:
 
     QAction* m_SaveSceneAction = nullptr;
     QAction* m_BuildGameAction = nullptr;
-    QAction* m_RealisticLightingAction = nullptr;
-    QAction* m_VoxelLightingAction = nullptr;
     QAction* m_PlayAction = nullptr;
     QAction* m_PauseAction = nullptr;
     QAction* m_StopAction = nullptr;

@@ -1,9 +1,11 @@
 #include "polyizon/game_scene_renderer.hpp"
 
 #include "polyizon/project_manifest.hpp"
+#include "polyizon/rendering/render_graph.hpp"
+#include "polyizon/rendering/forward_plus_lights.hpp"
+#include "polyizon/log.hpp"
 #include "polyizon/scene/components.hpp"
 #include "polyizon/scene/scene_serializer.hpp"
-#include "polyizon/vulkan/classic_sky_uniform_buffer_object.hpp"
 #include "polyizon/vulkan/context.hpp"
 #include "polyizon/vulkan/lit_uniform_buffer_object.hpp"
 #include "polyizon/vulkan/sky_uniform_buffer_object.hpp"
@@ -18,12 +20,19 @@
 
 namespace polyizon {
 
+namespace {
+
+bool IsEntityEnabled(const entt::registry& registry, entt::entity entity) {
+    const auto* metadata = registry.try_get<const EntityMetadataComponent>(entity);
+    return metadata == nullptr || metadata->enabled;
+}
+
+} // namespace
+
 GameSceneRenderer::GameSceneRenderer(VulkanContext& context, VkFormat colorFormat, VkFormat depthFormat)
     : m_Context(context) {
     m_SkyPipeline = std::make_unique<SkyPipeline>(context.GetDevice(), colorFormat, depthFormat);
-    m_ClassicSkyPipeline = std::make_unique<ClassicSkyPipeline>(context.GetDevice(), colorFormat, depthFormat);
     m_LitPipeline = std::make_unique<LitPipeline>(context.GetDevice(), colorFormat, depthFormat);
-    m_VoxelLitPipeline = std::make_unique<VoxelLitPipeline>(context.GetDevice(), colorFormat, depthFormat);
     m_ShadowPipeline = std::make_unique<ShadowPipeline>(context.GetDevice(), depthFormat);
 
     const CloudNoiseParams cloudNoiseParams{};
@@ -31,10 +40,7 @@ GameSceneRenderer::GameSceneRenderer(VulkanContext& context, VkFormat colorForma
     m_CloudNoiseTexture = std::make_unique<Texture3D>(context, cloudNoiseData.data(),
         cloudNoiseParams.resolution, cloudNoiseParams.resolution, cloudNoiseParams.resolution);
 
-    m_RealisticShadowMap = std::make_unique<ShadowMap>(
-        context, depthFormat, kRealisticShadowMapResolution, ShadowSamplerMode::HardwarePcf);
-    m_VoxelShadowMap = std::make_unique<ShadowMap>(
-        context, depthFormat, kVoxelShadowMapResolution, ShadowSamplerMode::PlainNearest);
+    m_ShadowMap = std::make_unique<ShadowMap>(context, depthFormat, kShadowMapResolution);
 
     CreateDescriptorResources();
 }
@@ -67,28 +73,27 @@ void GameSceneRenderer::CreateDescriptorResources() {
     for (std::uint32_t i = 0; i < kMaxFramesInFlight; ++i) {
         m_LitUniformBuffers[i] = std::make_unique<Buffer>(
             m_Context.GetAllocator(), sizeof(LitUniformBufferObject), VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT);
+        m_LocalLightBuffers[i] = std::make_unique<Buffer>(
+            m_Context.GetAllocator(), sizeof(ForwardPlusLightBuffer), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
         m_SkyUniformBuffers[i] = std::make_unique<Buffer>(
             m_Context.GetAllocator(), sizeof(SkyUniformBufferObject), VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT);
-        m_ClassicSkyUniformBuffers[i] = std::make_unique<Buffer>(m_Context.GetAllocator(),
-            sizeof(ClassicSkyUniformBufferObject), VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT);
     }
 
-    // Same shape as EditorViewportRenderer::CreateDescriptorResources: four
-    // sets per frame-in-flight (lit, voxelLit, sky, classicSky). UBO
-    // descriptors: one per set, all four. Combined-image-sampler
-    // descriptors: lit's shadow map, voxelLit's shadow map, sky's cloud
-    // noise volume — classicSky has none.
-    std::array<VkDescriptorPoolSize, 2> poolSizes{};
+    // Same shape as EditorViewportRenderer::CreateDescriptorResources: lit
+    // and sky sets per frame, with a shadow map and cloud noise texture.
+    std::array<VkDescriptorPoolSize, 3> poolSizes{};
     poolSizes[0].type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
-    poolSizes[0].descriptorCount = kMaxFramesInFlight * 4;
+    poolSizes[0].descriptorCount = kMaxFramesInFlight * 2;
     poolSizes[1].type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-    poolSizes[1].descriptorCount = kMaxFramesInFlight * 3;
+    poolSizes[1].descriptorCount = kMaxFramesInFlight * 2;
+    poolSizes[2].type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    poolSizes[2].descriptorCount = kMaxFramesInFlight;
 
     VkDescriptorPoolCreateInfo poolInfo{};
     poolInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
     poolInfo.poolSizeCount = static_cast<std::uint32_t>(poolSizes.size());
     poolInfo.pPoolSizes = poolSizes.data();
-    poolInfo.maxSets = kMaxFramesInFlight * 4;
+    poolInfo.maxSets = kMaxFramesInFlight * 2;
 
     if (vkCreateDescriptorPool(device, &poolInfo, nullptr, &m_DescriptorPool) != VK_SUCCESS) {
         throw std::runtime_error("Failed to create Vulkan descriptor pool");
@@ -105,17 +110,6 @@ void GameSceneRenderer::CreateDescriptorResources() {
         throw std::runtime_error("Failed to allocate Vulkan lit descriptor sets");
     }
 
-    std::array<VkDescriptorSetLayout, kMaxFramesInFlight> voxelLitLayouts{};
-    voxelLitLayouts.fill(m_VoxelLitPipeline->GetDescriptorSetLayout());
-    VkDescriptorSetAllocateInfo voxelLitAllocInfo{};
-    voxelLitAllocInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
-    voxelLitAllocInfo.descriptorPool = m_DescriptorPool;
-    voxelLitAllocInfo.descriptorSetCount = kMaxFramesInFlight;
-    voxelLitAllocInfo.pSetLayouts = voxelLitLayouts.data();
-    if (vkAllocateDescriptorSets(device, &voxelLitAllocInfo, m_VoxelLitDescriptorSets.data()) != VK_SUCCESS) {
-        throw std::runtime_error("Failed to allocate Vulkan voxel-lit descriptor sets");
-    }
-
     std::array<VkDescriptorSetLayout, kMaxFramesInFlight> skyLayouts{};
     skyLayouts.fill(m_SkyPipeline->GetDescriptorSetLayout());
     VkDescriptorSetAllocateInfo skyAllocInfo{};
@@ -127,29 +121,23 @@ void GameSceneRenderer::CreateDescriptorResources() {
         throw std::runtime_error("Failed to allocate Vulkan sky descriptor sets");
     }
 
-    std::array<VkDescriptorSetLayout, kMaxFramesInFlight> classicSkyLayouts{};
-    classicSkyLayouts.fill(m_ClassicSkyPipeline->GetDescriptorSetLayout());
-    VkDescriptorSetAllocateInfo classicSkyAllocInfo{};
-    classicSkyAllocInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
-    classicSkyAllocInfo.descriptorPool = m_DescriptorPool;
-    classicSkyAllocInfo.descriptorSetCount = kMaxFramesInFlight;
-    classicSkyAllocInfo.pSetLayouts = classicSkyLayouts.data();
-    if (vkAllocateDescriptorSets(device, &classicSkyAllocInfo, m_ClassicSkyDescriptorSets.data()) != VK_SUCCESS) {
-        throw std::runtime_error("Failed to allocate Vulkan classic-sky descriptor sets");
-    }
-
     for (std::uint32_t i = 0; i < kMaxFramesInFlight; ++i) {
         VkDescriptorBufferInfo litBufferInfo{};
         litBufferInfo.buffer = m_LitUniformBuffers[i]->GetBuffer();
         litBufferInfo.offset = 0;
         litBufferInfo.range = sizeof(LitUniformBufferObject);
 
-        VkDescriptorImageInfo realisticShadowMapInfo{};
-        realisticShadowMapInfo.sampler = m_RealisticShadowMap->GetSampler();
-        realisticShadowMapInfo.imageView = m_RealisticShadowMap->GetImageView();
-        realisticShadowMapInfo.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        VkDescriptorImageInfo shadowMapInfo{};
+        shadowMapInfo.sampler = m_ShadowMap->GetSampler();
+        shadowMapInfo.imageView = m_ShadowMap->GetImageView();
+        shadowMapInfo.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
 
-        std::array<VkWriteDescriptorSet, 2> litWrites{};
+        VkDescriptorBufferInfo localLightBufferInfo{};
+        localLightBufferInfo.buffer = m_LocalLightBuffers[i]->GetBuffer();
+        localLightBufferInfo.offset = 0;
+        localLightBufferInfo.range = sizeof(ForwardPlusLightBuffer);
+
+        std::array<VkWriteDescriptorSet, 3> litWrites{};
         litWrites[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
         litWrites[0].dstSet = m_LitDescriptorSets[i];
         litWrites[0].dstBinding = 0;
@@ -162,32 +150,16 @@ void GameSceneRenderer::CreateDescriptorResources() {
         litWrites[1].dstBinding = 1;
         litWrites[1].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
         litWrites[1].descriptorCount = 1;
-        litWrites[1].pImageInfo = &realisticShadowMapInfo;
+        litWrites[1].pImageInfo = &shadowMapInfo;
+
+        litWrites[2].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        litWrites[2].dstSet = m_LitDescriptorSets[i];
+        litWrites[2].dstBinding = 2;
+        litWrites[2].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        litWrites[2].descriptorCount = 1;
+        litWrites[2].pBufferInfo = &localLightBufferInfo;
 
         vkUpdateDescriptorSets(device, static_cast<std::uint32_t>(litWrites.size()), litWrites.data(), 0, nullptr);
-
-        VkDescriptorImageInfo voxelShadowMapInfo{};
-        voxelShadowMapInfo.sampler = m_VoxelShadowMap->GetSampler();
-        voxelShadowMapInfo.imageView = m_VoxelShadowMap->GetImageView();
-        voxelShadowMapInfo.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-
-        std::array<VkWriteDescriptorSet, 2> voxelLitWrites{};
-        voxelLitWrites[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-        voxelLitWrites[0].dstSet = m_VoxelLitDescriptorSets[i];
-        voxelLitWrites[0].dstBinding = 0;
-        voxelLitWrites[0].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
-        voxelLitWrites[0].descriptorCount = 1;
-        voxelLitWrites[0].pBufferInfo = &litBufferInfo;
-
-        voxelLitWrites[1].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-        voxelLitWrites[1].dstSet = m_VoxelLitDescriptorSets[i];
-        voxelLitWrites[1].dstBinding = 1;
-        voxelLitWrites[1].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-        voxelLitWrites[1].descriptorCount = 1;
-        voxelLitWrites[1].pImageInfo = &voxelShadowMapInfo;
-
-        vkUpdateDescriptorSets(
-            device, static_cast<std::uint32_t>(voxelLitWrites.size()), voxelLitWrites.data(), 0, nullptr);
 
         VkDescriptorBufferInfo skyBufferInfo{};
         skyBufferInfo.buffer = m_SkyUniformBuffers[i]->GetBuffer();
@@ -216,20 +188,6 @@ void GameSceneRenderer::CreateDescriptorResources() {
 
         vkUpdateDescriptorSets(device, static_cast<std::uint32_t>(skyWrites.size()), skyWrites.data(), 0, nullptr);
 
-        VkDescriptorBufferInfo classicSkyBufferInfo{};
-        classicSkyBufferInfo.buffer = m_ClassicSkyUniformBuffers[i]->GetBuffer();
-        classicSkyBufferInfo.offset = 0;
-        classicSkyBufferInfo.range = sizeof(ClassicSkyUniformBufferObject);
-
-        VkWriteDescriptorSet classicSkyWrite{};
-        classicSkyWrite.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-        classicSkyWrite.dstSet = m_ClassicSkyDescriptorSets[i];
-        classicSkyWrite.dstBinding = 0;
-        classicSkyWrite.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
-        classicSkyWrite.descriptorCount = 1;
-        classicSkyWrite.pBufferInfo = &classicSkyBufferInfo;
-
-        vkUpdateDescriptorSets(device, 1, &classicSkyWrite, 0, nullptr);
     }
 }
 
@@ -250,8 +208,45 @@ glm::vec3 GameSceneRenderer::GetSunDirection() const {
         std::cos(elevation) * std::sin(azimuth)));
 }
 
+glm::vec3 GameSceneRenderer::GetDirectionalLightDirection() const {
+    const entt::registry& registry = m_Scene.GetRegistry();
+    const auto view = registry.view<const TransformComponent, const DirectionalLightComponent>();
+    for (const entt::entity entity : view) {
+        const auto& light = view.get<const DirectionalLightComponent>(entity);
+        if (IsEntityEnabled(registry, entity) && light.enabled && light.mobility != LightMobility::Baked) {
+            return glm::normalize(-view.get<const TransformComponent>(entity).GetForward());
+        }
+    }
+    return GetSunDirection();
+}
+
+glm::vec4 GameSceneRenderer::GetDirectionalLightColorAndIntensity() const {
+    const entt::registry& registry = m_Scene.GetRegistry();
+    const auto view = registry.view<const DirectionalLightComponent>();
+    for (const entt::entity entity : view) {
+        const auto& light = view.get<const DirectionalLightComponent>(entity);
+        if (IsEntityEnabled(registry, entity) && light.enabled && light.mobility != LightMobility::Baked) {
+            return glm::vec4(light.color, light.intensity);
+        }
+    }
+    const SceneLightingSettings& lighting = m_Scene.GetLightingSettings();
+    return glm::vec4(lighting.directionalLightColor, lighting.directionalLightIntensity);
+}
+
+bool GameSceneRenderer::GetDirectionalLightCastsShadows() const {
+    const entt::registry& registry = m_Scene.GetRegistry();
+    const auto view = registry.view<const DirectionalLightComponent>();
+    for (const entt::entity entity : view) {
+        const auto& light = view.get<const DirectionalLightComponent>(entity);
+        if (IsEntityEnabled(registry, entity) && light.enabled && light.mobility != LightMobility::Baked) {
+            return light.castsShadows;
+        }
+    }
+    return true;
+}
+
 glm::mat4 GameSceneRenderer::GetLightSpaceMatrix() const {
-    const glm::vec3 sunDir = GetSunDirection();
+    const glm::vec3 sunDir = GetDirectionalLightDirection();
     const glm::vec3 sceneCenter(0.0f, 0.5f, 0.0f);
     constexpr float kLightDistance = 15.0f;
     constexpr float kOrthoHalfExtent = 8.0f;
@@ -271,42 +266,21 @@ void GameSceneRenderer::UpdateLitUniformBuffer(std::uint32_t frameIndex, const g
     ubo.view = view;
     ubo.proj = proj;
     ubo.lightSpaceMatrix = GetLightSpaceMatrix();
-    ubo.sunDirectionAndAmbient = glm::vec4(GetSunDirection(), m_Scene.GetLightingSettings().ambientStrength);
+    const SceneLightingSettings& lighting = m_Scene.GetLightingSettings();
+    ubo.sunDirectionAndAmbient = glm::vec4(GetDirectionalLightDirection(), lighting.ambientStrength);
+    ubo.directionalLightColorAndIntensity = GetDirectionalLightColorAndIntensity();
 
-    entt::registry& registry = m_Scene.GetRegistry();
-
-    int pointCount = 0;
-    auto pointView = registry.view<const TransformComponent, const PointLightComponent>();
-    for (const entt::entity entity : pointView) {
-        if (pointCount >= kMaxPointLights) {
-            break;
+    ubo.renderFlags.x = GetDirectionalLightCastsShadows() ? 1 : 0;
+    const ForwardPlusLightBuffer localLights = BuildForwardPlusLightBuffer(m_Scene);
+    if (localLights.counts.w != m_LastDroppedLightCount) {
+        m_LastDroppedLightCount = localLights.counts.w;
+        if (m_LastDroppedLightCount > 0) {
+            Log::Warning("Forward+ light buffer full: " + std::to_string(m_LastDroppedLightCount) +
+                " local lights were not submitted");
         }
-        const auto& transform = pointView.get<const TransformComponent>(entity);
-        const auto& light = pointView.get<const PointLightComponent>(entity);
-        ubo.pointLightPositionAndRange[pointCount] = glm::vec4(transform.position, light.range);
-        ubo.pointLightColorAndIntensity[pointCount] = glm::vec4(light.color, light.intensity);
-        ++pointCount;
     }
-
-    int spotCount = 0;
-    auto spotView = registry.view<const TransformComponent, const SpotLightComponent>();
-    for (const entt::entity entity : spotView) {
-        if (spotCount >= kMaxSpotLights) {
-            break;
-        }
-        const auto& transform = spotView.get<const TransformComponent>(entity);
-        const auto& light = spotView.get<const SpotLightComponent>(entity);
-        ubo.spotLightPositionAndRange[spotCount] = glm::vec4(transform.position, light.range);
-        ubo.spotLightColorAndIntensity[spotCount] = glm::vec4(light.color, light.intensity);
-        ubo.spotLightDirectionAndInnerCos[spotCount] =
-            glm::vec4(transform.GetForward(), std::cos(glm::radians(light.innerConeDegrees)));
-        ubo.spotLightOuterCos[spotCount] = glm::vec4(std::cos(glm::radians(light.outerConeDegrees)), 0.0f, 0.0f, 0.0f);
-        ++spotCount;
-    }
-
-    ubo.lightCounts = glm::ivec4(pointCount, spotCount, 0, 0);
-
     m_LitUniformBuffers[frameIndex]->Upload(&ubo, sizeof(ubo));
+    m_LocalLightBuffers[frameIndex]->Upload(&localLights, sizeof(localLights));
 }
 
 void GameSceneRenderer::UpdateSkyUniformBuffer(
@@ -319,59 +293,27 @@ void GameSceneRenderer::UpdateSkyUniformBuffer(
     // Same fixed tunables Application's own hardcoded demo uses — no
     // per-scene authoring for these this phase (matching EditorViewportRenderer's
     // identical "not yet developer-editable" sky/cloud fields).
+    const SceneLightingSettings& lighting = m_Scene.GetLightingSettings();
     sky.timeAndSun = glm::vec4(time, glm::radians(1.5f), 0.0f, 0.0f);
     sky.atmosphereParams0 = glm::vec4(6360.0f, 60.0f, 0.5f, 8.0f);
-    sky.atmosphereParams1 = glm::vec4(1.2f, 0.76f, 10.0f, 1.2f);
-    sky.cloudParams0 = glm::vec4(1.5f, 4.0f, 0.32f, 0.9f);
-    sky.cloudParams1 = glm::vec4(0.002f, 0.0f, 0.8f, -0.2f);
-    sky.cloudParams2 = glm::vec4(1.0f, 0.2f, 0.16f, 0.0f);
-    sky.stepCounts = glm::ivec4(16, 8, 96, 12);
+    sky.atmosphereParams1 = glm::vec4(1.2f, 0.76f, lighting.skySunIntensity, lighting.skyExposure);
+    sky.cloudParams0 = glm::vec4(lighting.cloudLayerBottomKm, lighting.cloudLayerTopKm,
+        lighting.cloudCoverage, lighting.cloudDensity);
+    sky.cloudParams1 = glm::vec4(lighting.cloudWindSpeed,
+        glm::radians(lighting.cloudWindDirectionDegrees), 0.8f, -0.2f);
+    sky.cloudParams2 = glm::vec4(lighting.cloudPowderStrength, lighting.cloudAmbientStrength,
+        lighting.cloudNoiseScale, lighting.cloudsEnabled ? 1.0f : 0.0f);
+    sky.stepCounts = glm::ivec4(16, 8, lighting.cloudPrimarySteps, lighting.cloudShadowSteps);
 
     m_SkyUniformBuffers[frameIndex]->Upload(&sky, sizeof(sky));
 }
 
-void GameSceneRenderer::UpdateClassicSkyUniformBuffer(
-    std::uint32_t frameIndex, const glm::mat4& view, const glm::mat4& proj) {
-    ClassicSkyUniformBufferObject sky{};
-    sky.invView = glm::inverse(view);
-    sky.invProj = glm::inverse(proj);
-    sky.sunDirection = glm::vec4(GetSunDirection(), glm::radians(1.5f));
-
-    sky.dayHorizonColor = glm::vec4(0.75f, 0.85f, 1.0f, 0.0f);
-    sky.dayZenithColor = glm::vec4(0.25f, 0.55f, 0.95f, 0.0f);
-    sky.nightHorizonColor = glm::vec4(0.05f, 0.06f, 0.12f, 0.0f);
-    sky.nightZenithColor = glm::vec4(0.01f, 0.01f, 0.04f, 0.0f);
-
-    m_ClassicSkyUniformBuffers[frameIndex]->Upload(&sky, sizeof(sky));
-}
-
 void GameSceneRenderer::RenderShadowPass(VkCommandBuffer cmd) {
-    const bool voxelMode = (m_Scene.GetLightingSettings().mode == LightingMode::Voxel);
-    ShadowMap& activeShadowMap = voxelMode ? *m_VoxelShadowMap : *m_RealisticShadowMap;
-    bool& firstFrame = voxelMode ? m_VoxelShadowMapFirstFrame : m_RealisticShadowMapFirstFrame;
-
-    const VkImageSubresourceRange depthRange{ VK_IMAGE_ASPECT_DEPTH_BIT, 0, 1, 0, 1 };
-
-    VkImageMemoryBarrier2 toDepthAttachment{};
-    toDepthAttachment.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
-    toDepthAttachment.srcStageMask =
-        firstFrame ? VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT : VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT;
-    toDepthAttachment.srcAccessMask = firstFrame ? VK_ACCESS_2_NONE : VK_ACCESS_2_SHADER_READ_BIT;
-    toDepthAttachment.dstStageMask =
-        VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT;
-    toDepthAttachment.dstAccessMask = VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
-    toDepthAttachment.oldLayout = firstFrame ? VK_IMAGE_LAYOUT_UNDEFINED : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-    toDepthAttachment.newLayout = VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL;
-    toDepthAttachment.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    toDepthAttachment.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    toDepthAttachment.image = activeShadowMap.GetImage();
-    toDepthAttachment.subresourceRange = depthRange;
-
-    VkDependencyInfo toDepthDep{};
-    toDepthDep.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
-    toDepthDep.imageMemoryBarrierCount = 1;
-    toDepthDep.pImageMemoryBarriers = &toDepthAttachment;
-    vkCmdPipelineBarrier2(cmd, &toDepthDep);
+    ShadowMap& activeShadowMap = *m_ShadowMap;
+    m_ImageStates.Transition(cmd, activeShadowMap.GetImage(), VK_IMAGE_ASPECT_DEPTH_BIT,
+        { VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL,
+            VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT,
+            VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT });
 
     VkRenderingAttachmentInfo depthAttachment{};
     depthAttachment.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
@@ -406,6 +348,9 @@ void GameSceneRenderer::RenderShadowPass(VkCommandBuffer cmd) {
     const glm::mat4 lightSpaceMatrix = GetLightSpaceMatrix();
     auto view = m_Scene.GetRegistry().view<TransformComponent, MeshComponent>();
     for (auto entity : view) {
+        if (!IsEntityEnabled(m_Scene.GetRegistry(), entity)) {
+            continue;
+        }
         const auto& [transform, meshComponent] = view.get<TransformComponent, MeshComponent>(entity);
         const glm::mat4 lightSpaceMVP = lightSpaceMatrix * transform.GetMatrix();
         vkCmdPushConstants(cmd, m_ShadowPipeline->GetLayout(), VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof(glm::mat4), &lightSpaceMVP);
@@ -419,63 +364,20 @@ void GameSceneRenderer::RenderShadowPass(VkCommandBuffer cmd) {
 
     vkCmdEndRendering(cmd);
 
-    VkImageMemoryBarrier2 toShaderRead = toDepthAttachment;
-    toShaderRead.srcStageMask =
-        VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT;
-    toShaderRead.srcAccessMask = VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
-    toShaderRead.dstStageMask = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT;
-    toShaderRead.dstAccessMask = VK_ACCESS_2_SHADER_READ_BIT;
-    toShaderRead.oldLayout = VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL;
-    toShaderRead.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-
-    VkDependencyInfo toShaderReadDep{};
-    toShaderReadDep.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
-    toShaderReadDep.imageMemoryBarrierCount = 1;
-    toShaderReadDep.pImageMemoryBarriers = &toShaderRead;
-    vkCmdPipelineBarrier2(cmd, &toShaderReadDep);
-
-    firstFrame = false;
+    m_ImageStates.Transition(cmd, activeShadowMap.GetImage(), VK_IMAGE_ASPECT_DEPTH_BIT,
+        { VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
+            VK_ACCESS_2_SHADER_READ_BIT });
 }
 
 void GameSceneRenderer::RenderMainPass(VkCommandBuffer cmd, VkImage colorImage, VkImageView colorImageView,
     VkImage depthImage, VkImageView depthImageView, VkExtent2D extent) {
-    const VkImageSubresourceRange colorRange{ VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
-
-    VkImageMemoryBarrier2 toColorAttachment{};
-    toColorAttachment.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
-    toColorAttachment.srcStageMask = VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT;
-    toColorAttachment.srcAccessMask = VK_ACCESS_2_NONE;
-    toColorAttachment.dstStageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
-    toColorAttachment.dstAccessMask = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT;
-    toColorAttachment.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-    toColorAttachment.newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-    toColorAttachment.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    toColorAttachment.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    toColorAttachment.image = colorImage;
-    toColorAttachment.subresourceRange = colorRange;
-
-    const VkImageSubresourceRange depthRange{ VK_IMAGE_ASPECT_DEPTH_BIT, 0, 1, 0, 1 };
-
-    VkImageMemoryBarrier2 toDepthAttachment{};
-    toDepthAttachment.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
-    toDepthAttachment.srcStageMask = VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT;
-    toDepthAttachment.srcAccessMask = VK_ACCESS_2_NONE;
-    toDepthAttachment.dstStageMask =
-        VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT;
-    toDepthAttachment.dstAccessMask = VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
-    toDepthAttachment.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-    toDepthAttachment.newLayout = VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL;
-    toDepthAttachment.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    toDepthAttachment.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    toDepthAttachment.image = depthImage;
-    toDepthAttachment.subresourceRange = depthRange;
-
-    const std::array<VkImageMemoryBarrier2, 2> toAttachmentBarriers = { toColorAttachment, toDepthAttachment };
-    VkDependencyInfo toAttachmentDep{};
-    toAttachmentDep.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
-    toAttachmentDep.imageMemoryBarrierCount = static_cast<std::uint32_t>(toAttachmentBarriers.size());
-    toAttachmentDep.pImageMemoryBarriers = toAttachmentBarriers.data();
-    vkCmdPipelineBarrier2(cmd, &toAttachmentDep);
+    m_ImageStates.Transition(cmd, colorImage, VK_IMAGE_ASPECT_COLOR_BIT,
+        { VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+            VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT }, true);
+    m_ImageStates.Transition(cmd, depthImage, VK_IMAGE_ASPECT_DEPTH_BIT,
+        { VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL,
+            VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT,
+            VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT }, true);
 
     VkRenderingAttachmentInfo colorAttachment{};
     colorAttachment.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
@@ -512,48 +414,28 @@ void GameSceneRenderer::RenderMainPass(VkCommandBuffer cmd, VkImage colorImage, 
     VkRect2D scissor{ { 0, 0 }, extent };
     vkCmdSetScissor(cmd, 0, 1, &scissor);
 
-    if (m_Scene.GetLightingSettings().mode == LightingMode::Voxel) {
-        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_ClassicSkyPipeline->GetPipeline());
-        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_ClassicSkyPipeline->GetLayout(), 0, 1,
-            &m_ClassicSkyDescriptorSets[m_CurrentFrameIndex], 0, nullptr);
-        vkCmdDraw(cmd, 3, 1, 0, 0);
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_SkyPipeline->GetPipeline());
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_SkyPipeline->GetLayout(), 0, 1,
+        &m_SkyDescriptorSets[m_CurrentFrameIndex], 0, nullptr);
+    vkCmdDraw(cmd, 3, 1, 0, 0);
 
-        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_VoxelLitPipeline->GetPipeline());
-        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_VoxelLitPipeline->GetLayout(), 0, 1,
-            &m_VoxelLitDescriptorSets[m_CurrentFrameIndex], 0, nullptr);
-        DrawLitEntities(cmd, m_VoxelLitPipeline->GetLayout());
-    } else {
-        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_SkyPipeline->GetPipeline());
-        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_SkyPipeline->GetLayout(), 0, 1,
-            &m_SkyDescriptorSets[m_CurrentFrameIndex], 0, nullptr);
-        vkCmdDraw(cmd, 3, 1, 0, 0);
-
-        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_LitPipeline->GetPipeline());
-        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_LitPipeline->GetLayout(), 0, 1,
-            &m_LitDescriptorSets[m_CurrentFrameIndex], 0, nullptr);
-        DrawLitEntities(cmd, m_LitPipeline->GetLayout());
-    }
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_LitPipeline->GetPipeline());
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_LitPipeline->GetLayout(), 0, 1,
+        &m_LitDescriptorSets[m_CurrentFrameIndex], 0, nullptr);
+    DrawLitEntities(cmd, m_LitPipeline->GetLayout());
 
     vkCmdEndRendering(cmd);
 
-    VkImageMemoryBarrier2 toPresent = toColorAttachment;
-    toPresent.srcStageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
-    toPresent.srcAccessMask = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT;
-    toPresent.dstStageMask = VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT;
-    toPresent.dstAccessMask = VK_ACCESS_2_NONE;
-    toPresent.oldLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-    toPresent.newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
-
-    VkDependencyInfo toPresentDep{};
-    toPresentDep.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
-    toPresentDep.imageMemoryBarrierCount = 1;
-    toPresentDep.pImageMemoryBarriers = &toPresent;
-    vkCmdPipelineBarrier2(cmd, &toPresentDep);
+    m_ImageStates.Transition(cmd, colorImage, VK_IMAGE_ASPECT_COLOR_BIT,
+        { VK_IMAGE_LAYOUT_PRESENT_SRC_KHR, VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT, VK_ACCESS_2_NONE });
 }
 
 void GameSceneRenderer::DrawLitEntities(VkCommandBuffer cmd, VkPipelineLayout pipelineLayout) {
     auto view = m_Scene.GetRegistry().view<TransformComponent, MeshComponent, MaterialComponent>();
     for (auto entity : view) {
+        if (!IsEntityEnabled(m_Scene.GetRegistry(), entity)) {
+            continue;
+        }
         const auto& [transform, meshComponent, material] =
             view.get<TransformComponent, MeshComponent, MaterialComponent>(entity);
 
@@ -564,6 +446,12 @@ void GameSceneRenderer::DrawLitEntities(VkCommandBuffer cmd, VkPipelineLayout pi
         pc.baseColor[1] = material.baseColor.g;
         pc.baseColor[2] = material.baseColor.b;
         pc.baseColor[3] = 1.0f;
+        pc.materialParams[0] = material.metallic;
+        pc.materialParams[1] = material.roughness;
+        pc.emissiveColorAndIntensity[0] = material.emissiveColor.r;
+        pc.emissiveColorAndIntensity[1] = material.emissiveColor.g;
+        pc.emissiveColorAndIntensity[2] = material.emissiveColor.b;
+        pc.emissiveColorAndIntensity[3] = material.emissiveIntensity;
         vkCmdPushConstants(cmd, pipelineLayout,
             VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(pc), &pc);
 
@@ -582,10 +470,13 @@ void GameSceneRenderer::RecordFrame(VkCommandBuffer cmd, VkImage colorImage, VkI
 
     UpdateLitUniformBuffer(frameIndex, view, proj);
     UpdateSkyUniformBuffer(frameIndex, view, proj, elapsedSeconds);
-    UpdateClassicSkyUniformBuffer(frameIndex, view, proj);
 
-    RenderShadowPass(cmd);
-    RenderMainPass(cmd, colorImage, colorImageView, depthImage, depthImageView, extent);
+    RenderGraph graph = BuildForwardSceneRenderGraph(
+        [this, cmd] { RenderShadowPass(cmd); },
+        [this, cmd, colorImage, colorImageView, depthImage, depthImageView, extent] {
+            RenderMainPass(cmd, colorImage, colorImageView, depthImage, depthImageView, extent);
+        });
+    graph.Execute();
 }
 
 } // namespace polyizon

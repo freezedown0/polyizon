@@ -35,19 +35,20 @@ target_sources(polyizon_core
         src/noise.cpp
         src/project_manifest.cpp
         src/game_scene_renderer.cpp
+        src/rendering/render_graph.cpp
+        src/rendering/forward_plus_lights.cpp
 
         # Vulkan abstraction layer
         src/vulkan/context.cpp
         src/vulkan/swapchain.cpp
         src/vulkan/pipeline.cpp
         src/vulkan/sky_pipeline.cpp
-        src/vulkan/classic_sky_pipeline.cpp
         src/vulkan/lit_pipeline.cpp
-        src/vulkan/voxel_lit_pipeline.cpp
         src/vulkan/shadow_pipeline.cpp
         src/vulkan/gizmo_pipeline.cpp
         src/vulkan/buffer.cpp
         src/vulkan/image.cpp
+        src/vulkan/image_state_tracker.cpp
         src/vulkan/texture3d.cpp
         src/vulkan/mesh.cpp
         src/vulkan/shadow_map.cpp
@@ -57,6 +58,7 @@ target_sources(polyizon_core
         src/assets/mesh_import.cpp
         src/scripting/script_engine.cpp
         src/scene/scene_serializer.cpp
+        src/scene/entity_uuid.cpp
 
         # Vendored imgui_impl_vulkan.cpp (see third_party/imgui_impl_vulkan/):
         # vcpkg's imgui port is installed WITHOUT its vulkan-binding feature
@@ -78,10 +80,8 @@ target_sources(polyizon_core
         # no separate/duplicate/colliding symbol names.
         ${CMAKE_SOURCE_DIR}/third_party/imgui_impl_vulkan/imgui_impl_vulkan.cpp
 
-        # Rendering subsystem (not yet implemented)
+        # Rendering subsystem
         # src/rendering/renderer.cpp
-        # src/rendering/voxel_shadow.cpp
-        # src/rendering/render_graph.cpp
 
         # ECS subsystem (not yet implemented)
         # src/ecs/registry.cpp
@@ -157,10 +157,8 @@ set(POLYIZON_SHADER_SOURCES
     ${POLYIZON_SHADER_SOURCE_DIR}/triangle.frag
     ${POLYIZON_SHADER_SOURCE_DIR}/sky.vert
     ${POLYIZON_SHADER_SOURCE_DIR}/sky.frag
-    ${POLYIZON_SHADER_SOURCE_DIR}/classic_sky.frag
     ${POLYIZON_SHADER_SOURCE_DIR}/lit.vert
     ${POLYIZON_SHADER_SOURCE_DIR}/lit.frag
-    ${POLYIZON_SHADER_SOURCE_DIR}/voxel_lit.frag
     ${POLYIZON_SHADER_SOURCE_DIR}/shadow.vert
     ${POLYIZON_SHADER_SOURCE_DIR}/gizmo.vert
     ${POLYIZON_SHADER_SOURCE_DIR}/gizmo.frag

@@ -9,7 +9,8 @@ class QModelIndex;
 class QTreeView;
 
 // Bottom dock panel: browses the current project's root folder (Scenes/,
-// Scripts/, Assets/, project.json). Double-clicking a .json file loads it
+// Scripts/, Assets/). The internal project.json manifest is hidden; double-
+// clicking a .scene file loads it
 // as the active scene. Phase 20 adds an "Add Files..." toolbar button
 // (import external files — models, textures, scripts — into whichever
 // folder is currently selected, or the project root if nothing is) — still

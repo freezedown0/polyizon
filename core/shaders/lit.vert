@@ -23,7 +23,7 @@ layout(location = 0) out vec3 vWorldNormal;
 layout(location = 1) out vec4 vLightSpacePos;
 // Phase 19: point/spot light contribution needs the fragment's actual world
 // position (not just its light-space depth) to compute per-light distance
-// and direction — see lit.frag/voxel_lit.frag's ComputePointLightContribution/
+// and direction — see lit.frag's ComputePointLightContribution/
 // ComputeSpotLightContribution.
 layout(location = 2) out vec3 vWorldPos;
 

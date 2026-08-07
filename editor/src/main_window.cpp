@@ -21,6 +21,10 @@
 #include <QLineEdit>
 #include <QMenuBar>
 #include <QMessageBox>
+#include <QPainter>
+#include <QPixmap>
+#include <QStatusBar>
+#include <QStyle>
 #include <QTimer>
 #include <QToolBar>
 #include <QWidget>
@@ -32,12 +36,35 @@ namespace {
 // VulkanViewportWindow header comment) — correctness first, a render thread
 // is a later optimization if frame pacing becomes an issue.
 constexpr int kRenderIntervalMs = 16;
+
+enum class TransportIcon { Play, Pause, Stop };
+
+QIcon MakeTransportIcon(TransportIcon icon) {
+    QPixmap pixmap(18, 18);
+    pixmap.fill(Qt::transparent);
+    QPainter painter(&pixmap);
+    painter.setRenderHint(QPainter::Antialiasing);
+    painter.setPen(Qt::NoPen);
+    painter.setBrush(QColor("#e6ebf3"));
+    if (icon == TransportIcon::Play) {
+        painter.drawPolygon(QPolygonF({QPointF(5, 3), QPointF(15, 9), QPointF(5, 15)}));
+    } else if (icon == TransportIcon::Pause) {
+        painter.drawRoundedRect(QRectF(4, 3, 4, 12), 1, 1);
+        painter.drawRoundedRect(QRectF(11, 3, 4, 12), 1, 1);
+    } else {
+        painter.drawRoundedRect(QRectF(4, 4, 10, 10), 1.5, 1.5);
+    }
+    return QIcon(pixmap);
+}
 } // namespace
 
 MainWindow::MainWindow(QWidget* parent)
     : QMainWindow(parent) {
     setWindowTitle("Polyizon Editor");
     resize(1600, 900);
+    setDockOptions(QMainWindow::AnimatedDocks | QMainWindow::AllowNestedDocks | QMainWindow::AllowTabbedDocks);
+    setCorner(Qt::BottomLeftCorner, Qt::LeftDockWidgetArea);
+    setCorner(Qt::BottomRightCorner, Qt::RightDockWidgetArea);
 
     m_ViewportWindow = new VulkanViewportWindow();
     QWidget* container = QWidget::createWindowContainer(m_ViewportWindow, this);
@@ -50,24 +77,34 @@ MainWindow::MainWindow(QWidget* parent)
     m_ConsolePanel = new ConsolePanel(this);
 
     auto* hierarchyDock = new QDockWidget("Hierarchy", this);
+    hierarchyDock->setObjectName("HierarchyDock");
+    hierarchyDock->setMinimumWidth(250);
     hierarchyDock->setWidget(m_HierarchyPanel);
     addDockWidget(Qt::LeftDockWidgetArea, hierarchyDock);
 
     auto* inspectorDock = new QDockWidget("Inspector", this);
+    inspectorDock->setObjectName("InspectorDock");
+    inspectorDock->setMinimumWidth(280);
     inspectorDock->setWidget(m_InspectorPanel);
     addDockWidget(Qt::RightDockWidgetArea, inspectorDock);
 
     auto* contentBrowserDock = new QDockWidget("Content Browser", this);
+    contentBrowserDock->setObjectName("ContentBrowserDock");
+    contentBrowserDock->setMinimumHeight(180);
     contentBrowserDock->setWidget(m_ContentBrowserPanel);
     addDockWidget(Qt::BottomDockWidgetArea, contentBrowserDock);
 
     auto* consoleDock = new QDockWidget("Console", this);
+    consoleDock->setObjectName("ConsoleDock");
     consoleDock->setWidget(m_ConsolePanel);
     addDockWidget(Qt::BottomDockWidgetArea, consoleDock);
     tabifyDockWidget(contentBrowserDock, consoleDock);
     contentBrowserDock->raise(); // shown on top of the tab group initially
+    resizeDocks({hierarchyDock, inspectorDock}, {290, 320}, Qt::Horizontal);
+    resizeDocks({contentBrowserDock}, {220}, Qt::Vertical);
 
     connect(m_HierarchyPanel, &HierarchyPanel::EntitySelected, m_InspectorPanel, &InspectorPanel::SetSelectedEntity);
+    connect(m_InspectorPanel, &InspectorPanel::EntityPresentationChanged, m_HierarchyPanel, &HierarchyPanel::Refresh);
     // Phase 20: the viewport gizmo needs to know the current selection too
     // (to know what to draw/drag) — same signal, a second slot.
     connect(m_HierarchyPanel, &HierarchyPanel::EntitySelected, m_ViewportWindow, &VulkanViewportWindow::SetSelectedEntity);
@@ -77,7 +114,6 @@ MainWindow::MainWindow(QWidget* parent)
     // refreshing directly from LoadSceneFile, which would miss the deferred
     // case entirely.
     connect(m_ViewportWindow, &VulkanViewportWindow::SceneLoaded, m_HierarchyPanel, &HierarchyPanel::Refresh);
-    connect(m_ViewportWindow, &VulkanViewportWindow::SceneLoaded, this, &MainWindow::SyncLightingModeMenu);
     connect(m_ViewportWindow, &VulkanViewportWindow::SceneLoaded, this, &MainWindow::UpdatePlayActionsEnabled);
 
     QMenu* fileMenu = menuBar()->addMenu("&File");
@@ -90,30 +126,8 @@ MainWindow::MainWindow(QWidget* parent)
     m_BuildGameAction = fileMenu->addAction("&Build Game...", this, &MainWindow::OnBuildGame);
     m_BuildGameAction->setEnabled(false); // nothing to export until a project is loaded
 
-    // Realistic/Voxel: a live in-memory toggle on whichever scene is
-    // currently loaded (see SetLightingMode) — not a global editor setting,
-    // since different scenes can want different modes (see
-    // SceneLightingSettings). No project/scene loaded yet -> both actions
-    // are harmless no-ops (SetLightingMode guards on a null renderer).
     QMenu* lightingMenu = menuBar()->addMenu("&Lighting");
-    auto* lightingModeGroup = new QActionGroup(this);
-    lightingModeGroup->setExclusive(true);
-
-    m_RealisticLightingAction = lightingMenu->addAction("&Realistic");
-    m_RealisticLightingAction->setCheckable(true);
-    m_RealisticLightingAction->setChecked(true);
-    lightingModeGroup->addAction(m_RealisticLightingAction);
-    connect(m_RealisticLightingAction, &QAction::triggered, this,
-        [this]() { SetLightingMode(polyizon::LightingMode::Realistic); });
-
-    m_VoxelLightingAction = lightingMenu->addAction("&Voxel");
-    m_VoxelLightingAction->setCheckable(true);
-    lightingModeGroup->addAction(m_VoxelLightingAction);
-    connect(m_VoxelLightingAction, &QAction::triggered, this,
-        [this]() { SetLightingMode(polyizon::LightingMode::Voxel); });
-
-    lightingMenu->addSeparator();
-    lightingMenu->addAction("&Settings...", this, &MainWindow::OnOpenLightingSettings);
+    lightingMenu->addAction("&Environment Editor...", this, &MainWindow::OnOpenLightingSettings);
 
     // Play/Pause/Stop (Phase 19) — see EditorViewportRenderer::PlayState.
     // Same QAction objects added to both a menu (keyboard/menu-driven access)
@@ -124,10 +138,23 @@ MainWindow::MainWindow(QWidget* parent)
     m_PauseAction = playMenu->addAction("Pa&use", this, &MainWindow::OnPause);
     m_StopAction = playMenu->addAction("&Stop", this, &MainWindow::OnStop);
 
+    m_PlayAction->setIcon(MakeTransportIcon(TransportIcon::Play));
+    m_PauseAction->setIcon(MakeTransportIcon(TransportIcon::Pause));
+    m_StopAction->setIcon(MakeTransportIcon(TransportIcon::Stop));
+    m_PlayAction->setToolTip("Play scene");
+    m_PauseAction->setToolTip("Pause simulation");
+    m_StopAction->setToolTip("Stop and restore scene");
+
     QToolBar* playToolBar = addToolBar("Play");
+    playToolBar->setObjectName("PlayToolbar");
+    playToolBar->setMovable(false);
+    playToolBar->setToolButtonStyle(Qt::ToolButtonTextBesideIcon);
     playToolBar->addAction(m_PlayAction);
     playToolBar->addAction(m_PauseAction);
     playToolBar->addAction(m_StopAction);
+    playToolBar->widgetForAction(m_PlayAction)->setObjectName("PlayButton");
+    playToolBar->widgetForAction(m_PauseAction)->setObjectName("TransportButton");
+    playToolBar->widgetForAction(m_StopAction)->setObjectName("TransportButton");
 
     UpdatePlayActionsEnabled(); // nothing loaded yet -> all disabled until a scene loads
 
@@ -135,10 +162,13 @@ MainWindow::MainWindow(QWidget* parent)
     // buttons, same QActionGroup pattern as the Lighting mode toggle above.
     // Move is the default (matches EditorViewportRenderer::m_GizmoMode).
     QToolBar* gizmoToolBar = addToolBar("Gizmo");
+    gizmoToolBar->setObjectName("GizmoToolbar");
+    gizmoToolBar->setMovable(false);
     auto* gizmoModeGroup = new QActionGroup(this);
     gizmoModeGroup->setExclusive(true);
 
     QAction* moveGizmoAction = gizmoToolBar->addAction("Move");
+    moveGizmoAction->setToolTip("Move selected entity");
     moveGizmoAction->setCheckable(true);
     moveGizmoAction->setChecked(true);
     gizmoModeGroup->addAction(moveGizmoAction);
@@ -146,6 +176,7 @@ MainWindow::MainWindow(QWidget* parent)
         [this]() { m_ViewportWindow->SetGizmoMode(polyizon::GizmoMode::Move); });
 
     QAction* rotateGizmoAction = gizmoToolBar->addAction("Rotate");
+    rotateGizmoAction->setToolTip("Rotate selected entity");
     rotateGizmoAction->setCheckable(true);
     gizmoModeGroup->addAction(rotateGizmoAction);
     connect(rotateGizmoAction, &QAction::triggered, this,
@@ -153,6 +184,8 @@ MainWindow::MainWindow(QWidget* parent)
 
     QMenu* helpMenu = menuBar()->addMenu("&Help");
     helpMenu->addAction("&Credits...", this, &MainWindow::OnCredits);
+
+    statusBar()->showMessage("Ready  •  Open or create a project to begin");
 
     m_RenderTimer = new QTimer(this);
     connect(m_RenderTimer, &QTimer::timeout, this, [this]() {
@@ -304,7 +337,6 @@ void MainWindow::OnStop() {
     m_HierarchyPanel->Refresh();
     m_InspectorPanel->SetSelectedEntity(entt::null);
     m_ViewportWindow->SetSelectedEntity(entt::null);
-    SyncLightingModeMenu();
     UpdatePlayActionsEnabled();
 }
 
@@ -334,24 +366,4 @@ void MainWindow::UpdatePlayActionsEnabled() {
     m_PlayAction->setEnabled(hasScene && state != polyizon::PlayState::Playing);
     m_PauseAction->setEnabled(hasScene && state == polyizon::PlayState::Playing);
     m_StopAction->setEnabled(hasScene && state != polyizon::PlayState::Stopped);
-}
-
-void MainWindow::SetLightingMode(polyizon::LightingMode mode) {
-    polyizon::EditorViewportRenderer* renderer = m_ViewportWindow->GetRenderer();
-    if (!renderer) {
-        return; // no project/scene loaded yet - nothing to toggle
-    }
-    renderer->GetScene().GetLightingSettings().mode = mode;
-}
-
-void MainWindow::SyncLightingModeMenu() {
-    polyizon::EditorViewportRenderer* renderer = m_ViewportWindow->GetRenderer();
-    if (!renderer) {
-        return;
-    }
-    const bool isVoxel = renderer->GetScene().GetLightingSettings().mode == polyizon::LightingMode::Voxel;
-    // setChecked on a QActionGroup-exclusive action automatically unchecks
-    // its sibling - only need to (un)check the one that changed.
-    m_VoxelLightingAction->setChecked(isVoxel);
-    m_RealisticLightingAction->setChecked(!isVoxel);
 }

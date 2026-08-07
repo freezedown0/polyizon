@@ -70,7 +70,15 @@ void LitPipeline::CreateDescriptorSetLayout() {
     shadowMapBinding.descriptorCount = 1;
     shadowMapBinding.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
 
-    const std::array<VkDescriptorSetLayoutBinding, 2> bindings = { uboBinding, shadowMapBinding };
+    VkDescriptorSetLayoutBinding localLightBufferBinding{};
+    localLightBufferBinding.binding = 2;
+    localLightBufferBinding.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    localLightBufferBinding.descriptorCount = 1;
+    localLightBufferBinding.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+
+    const std::array<VkDescriptorSetLayoutBinding, 3> bindings = {
+        uboBinding, shadowMapBinding, localLightBufferBinding
+    };
 
     VkDescriptorSetLayoutCreateInfo layoutInfo{};
     layoutInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;

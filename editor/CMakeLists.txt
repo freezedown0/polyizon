@@ -32,6 +32,8 @@ target_include_directories(polyizon_editor
 target_sources(polyizon_editor
     PRIVATE
         src/main.cpp
+        src/editor_theme.cpp
+        src/component_icons.cpp
         src/main_window.cpp
         src/vulkan_viewport_window.cpp
         src/editor_viewport_renderer.cpp
@@ -66,7 +68,7 @@ set_target_properties(polyizon_editor PROPERTIES
 
 # Application icon (window/taskbar/Explorer)
 include(AppIcon)
-polyizon_add_app_icon(polyizon_editor "${CMAKE_SOURCE_DIR}/resources/Polyizon.ico")
+polyizon_add_app_icon(polyizon_editor "${CMAKE_SOURCE_DIR}/temporaryassets/Mark1.ico")
 
 # Deploy the QPA Windows platform plugin next to the executable (see the
 # find_package(Qt6QWindowsIntegrationPlugin) comment above for why this is
@@ -77,4 +79,21 @@ add_custom_command(TARGET polyizon_editor POST_BUILD
         "$<TARGET_FILE:Qt6::QWindowsIntegrationPlugin>"
         "$<TARGET_FILE_DIR:polyizon_editor>/platforms/"
     COMMENT "Deploying Qt platform plugin (qwindows.dll)"
+)
+
+# Temporary PNG brand assets exported from Figma. Keep these external to the
+# executable so they can be replaced without touching editor code while the
+# final multi-resolution Windows icon package is being prepared.
+add_custom_command(TARGET polyizon_editor POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E make_directory "$<TARGET_FILE_DIR:polyizon_editor>/branding"
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+        "${CMAKE_SOURCE_DIR}/temporaryassets/Mark.png"
+        "$<TARGET_FILE_DIR:polyizon_editor>/branding/PolyizonMark.png"
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+        "${CMAKE_SOURCE_DIR}/temporaryassets/Horizontal Lockup.png"
+        "$<TARGET_FILE_DIR:polyizon_editor>/branding/PolyizonHorizontalLockup.png"
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+        "${CMAKE_SOURCE_DIR}/temporaryassets/Wordmark.png"
+        "$<TARGET_FILE_DIR:polyizon_editor>/branding/PolyizonWordmark.png"
+    COMMENT "Deploying temporary Polyizon brand assets"
 )
